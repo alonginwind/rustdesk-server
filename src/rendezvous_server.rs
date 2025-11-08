@@ -882,6 +882,21 @@ impl RendezvousServer {
     }
 
     #[inline]
+    async fn test_user(api_url: &str, token: &str) -> bool {
+        let url = format!("{}/api/user/info", api_url);
+        let client = reqwest::Client::new();
+        if let Ok(resp) = client.get(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Accept", "application/json")
+            .send().await {
+                if resp.status() == reqwest::StatusCode::OK {
+                    return true;
+                }
+        }
+        false
+    }
+
+    #[inline]
     async fn handle_punch_hole_request(
         &mut self,
         addr: SocketAddr,
@@ -908,7 +923,7 @@ impl RendezvousServer {
                 });
                 return Ok((msg_out, None));
             } else if !jwt::SECRET.is_empty() {
-                let token = ph.token;
+                let token = ph.token.clone();
                 let token = jwt::verify_token(token.as_str());
                 if token.is_err() {
                     let mut msg_out = RendezvousMessage::new();
@@ -919,6 +934,15 @@ impl RendezvousServer {
                     });
                     return Ok((msg_out, None));
                 }
+            }
+            let token = ph.token;
+            if !Self::test_user("http://127.0.0.1:21114", token.as_str()).await {
+                let mut msg_out = RendezvousMessage::new();
+                msg_out.set_punch_hole_response(PunchHoleResponse {
+                    other_failure: String::from("Token error, please log in!"),
+                    ..Default::default()
+                });
+                return Ok((msg_out, None));
             }
         }
         let id = ph.id;
