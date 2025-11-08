@@ -204,12 +204,12 @@ jobs:
       - name: Create Release (${{ matrix.job.os }} - (${{ matrix.job.name }})
         uses: softprops/action-gh-release@v1
         with:
-          draft: true
+          draft: false
           files: ${{ matrix.job.name }}/rustdesk-server-${{ matrix.job.os }}-${{ matrix.job.name }}${{ matrix.job.suffix }}.zip
             
   # docker build and push of single-arch images
   docker:
-
+    if: false
     name: Docker push - ${{ matrix.job.name }}
     needs: build
     runs-on: ubuntu-24.04
@@ -282,7 +282,7 @@ jobs:
 
   # docker build and push of multiarch images
   docker-manifest:
-
+    if: false
     name: Docker manifest s6
     needs: docker
     runs-on: ubuntu-24.04
@@ -344,7 +344,7 @@ jobs:
             
   # docker build and push of single-arch images
   docker-classic:
-
+    if: false
     name: Docker push classic - ${{ matrix.job.name }}
     needs: build
     runs-on: ubuntu-24.04
@@ -414,7 +414,7 @@ jobs:
 
   # docker build and push of multiarch images
   docker-manifest-classic:
-
+    if: false
     name: Docker manifest classic
     needs: docker
     runs-on: ubuntu-24.04
@@ -509,7 +509,7 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
-          draft: true
+          draft: false
           files: |
             debian-build/rustdesk-server-hbbr_*_${{ matrix.job.debian_platform }}.deb
             debian-build/rustdesk-server-hbbs_*_${{ matrix.job.debian_platform }}.deb
