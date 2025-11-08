@@ -49,6 +49,8 @@ use std::{
     time::Instant,
 };
 
+use chrono::{Local, Timelike};
+
 #[derive(Clone, Debug)]
 enum Data {
     Msg(Box<RendezvousMessage>, SocketAddr),
@@ -1148,8 +1150,36 @@ impl RendezvousServer {
         } else if self.relay_servers.len() == 1 {
             return self.relay_servers[0].clone();
         }
-        let i = ROTATION_RELAY_SERVER.fetch_add(1, Ordering::SeqCst) % self.relay_servers.len();
-        self.relay_servers[i].clone()
+
+        // 多个中继时才进行判断
+        let hour = Local::now().hour();
+        let is_night = hour >= 18 || hour < 2;
+        let keyword = "shuangqingtech";
+
+        // 根据时间筛选候选服务器
+        let candidates: Vec<_> = if is_night {
+            self.relay_servers
+                .iter()
+                .filter(|x| x.contains(keyword))
+                .collect()
+        } else {
+            self.relay_servers
+                .iter()
+                .filter(|x| !x.contains(keyword))
+                .collect()
+        };
+
+        if candidates.is_empty() {
+            // 没有匹配时，用全列表轮询
+            let i = ROTATION_RELAY_SERVER.fetch_add(1, Ordering::SeqCst) % self.relay_servers.len();
+            self.relay_servers[i].clone()
+        } else if candidates.len() == 1 {
+            candidates[0].clone()
+        } else {
+            // Vec<&String> → Vec<String>
+            let i = ROTATION_RELAY_SERVER.fetch_add(1, Ordering::Relaxed) % candidates.len();
+            candidates[i].clone()
+        }
     }
 
     async fn check_cmd(&self, cmd: &str) -> String {
