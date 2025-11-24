@@ -29,7 +29,7 @@ use hbb_common::{
         self,
         io::{AsyncReadExt, AsyncWriteExt},
         net::{TcpListener, TcpStream},
-        sync::{mpsc, Mutex},
+        sync::{mpsc, Mutex, RwLock},
         time::{interval, Duration},
     },
     tokio_util::codec::Framed,
@@ -128,7 +128,9 @@ pub struct RendezvousServer {
     relay_servers0: Arc<RelayServers>,
     rendezvous_servers: Arc<Vec<String>>,
     inner: Arc<Inner>,
-    ws_map: Arc<Mutex<HashMap<SocketAddr, Sink>>>,
+    ws_map: Arc<RwLock<HashMap<String, Arc<Mutex<Sink>>>>>,
+    addr_peer: Arc<RwLock<HashMap<SocketAddr, String>>>,
+    online_cache: Arc<RwLock<HashMap<String, bool>>>,
 }
 
 enum LoopFailure {
@@ -187,7 +189,9 @@ impl RendezvousServer {
                 secure_tcp_pk_b,
                 secure_tcp_sk_b,
             }),
-            ws_map: Arc::new(Mutex::new(HashMap::new())),
+            ws_map: Arc::new(RwLock::new(HashMap::new())),
+            addr_peer: Arc::new(RwLock::new(HashMap::new())),
+            online_cache: Arc::new(RwLock::new(HashMap::new())),
         };
         log::info!("mask: {:?}", rs.inner.mask);
         log::info!("local-ip: {:?}", rs.inner.local_ip);
@@ -255,6 +259,15 @@ impl RendezvousServer {
                 }
             });
         };
+        let online_cache = rs.online_cache.clone();
+        let pm = Arc::new(rs.pm.clone());
+        tokio::spawn(async move {
+            check_online(online_cache, pm).await;
+        });
+        let ws_map = rs.ws_map.clone();
+        tokio::spawn(async move {
+            heartbeat_loop(ws_map).await;
+        });
         let main_task = async move {
             loop {
                 log::info!("Start");
@@ -413,7 +426,7 @@ impl RendezvousServer {
                     }
                 }
                 Some(rendezvous_message::Union::RegisterPk(rk)) => {
-                    let response = self.handle_register_pk(rk, addr, false).await;
+                    let response = self.handle_register_pk(rk.clone(), addr, false).await;
                     match response {
                         Err(err) => {
                             let mut msg_out = RendezvousMessage::new();
@@ -430,6 +443,8 @@ impl RendezvousServer {
                                 ..Default::default()
                             });
                             socket.send(&msg_out, addr).await?;
+                            self.ws_map.write().await.remove(&rk.id);
+                            self.addr_peer.write().await.remove(&try_into_v4(addr));
                         }
                     }
                 }
@@ -586,7 +601,7 @@ impl RendezvousServer {
                     Self::send_to_sink(sink, msg_out).await;
                 }
                 Some(rendezvous_message::Union::RegisterPk(rk)) => {
-                    let response = self.handle_register_pk(rk, addr, ws).await;
+                    let response = self.handle_register_pk(rk.clone(), addr, ws).await;
                     match response {
                         Err(err) => {
                             let mut msg_out = RendezvousMessage::new();
@@ -604,11 +619,9 @@ impl RendezvousServer {
                                 ..Default::default()
                             });
                             Self::send_to_sink(sink, msg_out).await;
-                            if ws {
-                                // for ws, we can only get addr when register_pk
-                                if let Some(sink) = sink.take() {
-                                    self.ws_map.lock().await.insert(try_into_v4(addr), sink);
-                                }
+                            if let Some(sink) = sink.take() {
+                                self.ws_map.write().await.insert(rk.id.clone(), Arc::new(Mutex::new(sink)));
+                                self.addr_peer.write().await.insert(try_into_v4(addr), rk.id);
                             }
                             return true;
                         }
@@ -649,7 +662,7 @@ impl RendezvousServer {
                     }
                 }
                 Some(rendezvous_message::Union::OnlineRequest(or)) => {
-                    let mut states = self.peers_online_state(or.peers).await;
+                    let states = self.peers_online_state(or.peers).await;
                     let mut msg_out = RendezvousMessage::new();
                     msg_out.set_online_response(OnlineResponse {
                         states: states.into(),
@@ -657,23 +670,36 @@ impl RendezvousServer {
                     });
                     Self::send_to_sink(sink, msg_out).await;
                 }
-                _ => {}
+                _ => {
+                    if bytes.is_empty() {
+                        if let Some(id) = self.addr_peer.read().await.get(&try_into_v4(addr)) {
+                            if let Some(old) = self.pm.get_in_memory(&id).await {
+                                let mut old = old.write().await;
+                                old.last_reg_time = Instant::now();
+                                return true;
+                            }
+                        }
+                    }
+                }
             }
         }
         false
     }
 
+    #[inline]
     async fn peers_online_state(&mut self, peers: Vec<String>) -> BytesMut {
+        let online_state = {
+            let state = self.online_cache.read().await;
+            state.clone()
+        };
         let mut states = BytesMut::zeroed((peers.len() + 7) / 8);
         for (i, peer_id) in peers.iter().enumerate() {
-            if let Some(peer) = self.pm.get_in_memory(peer_id).await {
-                let elapsed = peer.read().await.last_reg_time.elapsed().as_millis() as i32;
-                // bytes index from left to right
-                let states_idx = i / 8;
-                let bit_idx = 7 - i % 8;
-                if elapsed < REG_TIMEOUT {
-                    states[states_idx] |= 0x01 << bit_idx;
-                }
+            let is_online = online_state.get(peer_id).copied().unwrap_or(false);
+            // bytes index from left to right
+            let states_idx = i / 8;
+            let bit_idx = 7 - i % 8;
+            if is_online {
+                states[states_idx] |= 0x01 << bit_idx;
             }
         }
         states
@@ -683,7 +709,7 @@ impl RendezvousServer {
         &mut self,
         rk: RegisterPk,
         addr: SocketAddr,
-        ws: bool,
+        _ws: bool,
     ) -> Result<register_pk_response::Result, register_pk_response::Result> {
         if rk.uuid.is_empty() || rk.pk.is_empty() {
             return Err(INVALID_ID_FORMAT);
@@ -698,7 +724,7 @@ impl RendezvousServer {
             //return Err(send_rk_res(socket, addr, TOO_FREQUENT).await);
         }
         let peer = self.pm.get_or(&id).await;
-        let (changed, ip_changed) = {
+        let (_changed, ip_changed) = {
             let peer = peer.read().await;
             if peer.uuid.is_empty() {
                 (true, false)
@@ -764,10 +790,7 @@ impl RendezvousServer {
                 );
             }
         }
-        if changed || ws {
-            // update peer info，解决tcp过程中不更新在线时间的问题
-            self.pm.update_pk(id, peer, addr, rk.uuid, rk.pk, ip).await;
-        }
+        self.pm.update_pk(id, peer, addr, rk.uuid, rk.pk, ip).await;
         Ok(register_pk_response::Result::OK)
         // let mut msg_out = RendezvousMessage::new();
         // msg_out.set_register_pk_response(RegisterPkResponse {
@@ -1030,8 +1053,7 @@ impl RendezvousServer {
         stream: &mut FramedStream,
         peers: Vec<String>,
     ) -> ResultType<()> {
-        let mut states = self.peers_online_state(peers).await;
-
+        let states = self.peers_online_state(peers).await;
         let mut msg_out = RendezvousMessage::new();
         msg_out.set_online_response(OnlineResponse {
             states: states.into(),
@@ -1076,11 +1098,14 @@ impl RendezvousServer {
         key: &str,
         ws: bool,
     ) -> ResultType<()> {
-        let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, ws).await?;
+        let (msg, to_addr) = self.handle_punch_hole_request(addr, ph.clone(), key, ws).await?;
         if let Some(addr) = to_addr {
-            let mut sink = self.ws_map.lock().await.remove(&try_into_v4(addr));
-            if let Some(s) = sink.as_mut() {
-                s.send(&msg).await;
+            if let Some(s) = {
+                let map = self.ws_map.read().await;
+                map.get(&ph.id).cloned()
+            } {
+                let mut sink = s.lock().await;
+                sink.send(&msg).await;
             } else {
                 self.tx.send(Data::Msg(msg.into(), addr))?;
             }
@@ -1553,6 +1578,50 @@ impl RendezvousServer {
                 Self::send_to_sink(sink, msg_out).await;
             }
             None => {}
+        }
+    }
+}
+
+async fn heartbeat_loop(ws_map: Arc<RwLock<HashMap<String, Arc<Mutex<Sink>>>>>) {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(REG_TIMEOUT as u64 / 2)).await;
+
+        let sinks = {
+            let map = ws_map.read().await;
+            map.values().cloned().collect::<Vec<_>>()
+        };
+
+        for chunk in sinks.chunks(200) {
+            for sink in chunk {
+                let sink = sink.clone();
+                tokio::spawn(async move {
+                    if let Ok(mut s) = sink.try_lock() {
+                        let _ = timeout(REG_TIMEOUT as u64, async {
+                            s.send(&RendezvousMessage::new()).await
+                        }).await;
+                    }
+                });
+            }
+        }
+    }
+}
+
+async fn check_online(
+    online_cache: Arc<RwLock<HashMap<String, bool>>>,
+    pm: Arc<PeerMap>)
+{
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(REG_TIMEOUT as u64 / 2)).await;
+
+        let mut cache = online_cache.write().await;
+        let peer_ids = pm.get_all_ids().await;
+        for id in &peer_ids {
+            if let Some(peer) = pm.get_in_memory(id).await {
+                let elapsed = peer.read().await.last_reg_time.elapsed().as_millis() as i32;
+                cache.insert(id.clone(), elapsed < REG_TIMEOUT);
+            } else {
+                cache.insert(id.clone(), false);
+            }
         }
     }
 }
