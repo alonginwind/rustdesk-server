@@ -50,6 +50,7 @@ use std::{
 };
 
 use chrono::{Local, Timelike};
+use ip2region::{CachePolicy, Searcher};
 
 #[derive(Clone, Debug)]
 enum Data {
@@ -131,6 +132,7 @@ pub struct RendezvousServer {
     ws_map: Arc<RwLock<HashMap<String, Arc<Mutex<Sink>>>>>,
     addr_peer: Arc<RwLock<HashMap<SocketAddr, String>>>,
     online_cache: Arc<RwLock<HashMap<String, bool>>>,
+    ipv4_searcher: Arc<Searcher>,
 }
 
 enum LoopFailure {
@@ -192,6 +194,7 @@ impl RendezvousServer {
             ws_map: Arc::new(RwLock::new(HashMap::new())),
             addr_peer: Arc::new(RwLock::new(HashMap::new())),
             online_cache: Arc::new(RwLock::new(HashMap::new())),
+            ipv4_searcher: Arc::new(Searcher::new("./ip2region_v4.xdb".to_owned(), CachePolicy::FullMemory).unwrap()),
         };
         log::info!("mask: {:?}", rs.inner.mask);
         log::info!("local-ip: {:?}", rs.inner.local_ip);
@@ -573,7 +576,7 @@ impl RendezvousServer {
                             // https://github.com/rustdesk/rustdesk-server/issues/24
                             rr.relay_server = self.inner.local_ip.clone();
                         } else if rr.relay_server == self.inner.local_ip {
-                            rr.relay_server = self.get_relay_server(addr.ip(), addr_b.ip());
+                            rr.relay_server = self.get_relay_server(addr.ip(), addr_b.ip()).0;
                         }
                     }
                     msg_out.set_relay_response(rr);
@@ -992,8 +995,8 @@ impl RendezvousServer {
             let mut msg_out = RendezvousMessage::new();
             let peer_is_lan = self.is_lan(peer_addr);
             let is_lan = self.is_lan(addr);
-            let mut relay_server = self.get_relay_server(addr.ip(), peer_addr.ip());
-            if ALWAYS_USE_RELAY.load(Ordering::SeqCst) || (peer_is_lan ^ is_lan) {
+            let (mut relay_server, force_relay) = self.get_relay_server(addr.ip(), peer_addr.ip());
+            if ALWAYS_USE_RELAY.load(Ordering::SeqCst) || (peer_is_lan ^ is_lan || force_relay) {
                 if peer_is_lan {
                     // https://github.com/rustdesk/rustdesk-server/issues/24
                     relay_server = self.inner.local_ip.clone()
@@ -1169,32 +1172,72 @@ impl RendezvousServer {
         self.relay_servers = self.relay_servers0.clone();
     }
 
-    fn get_relay_server(&self, _pa: IpAddr, _pb: IpAddr) -> String {
+    fn query_ip(&self, addr: IpAddr) -> String {
+        let ip = addr.to_string();
+        let record = self.ipv4_searcher.search(ip.as_str()).unwrap_or_default();
+
+        let parts: Vec<&str> = record.split('|').collect();
+        let country = parts.get(0).unwrap_or(&"").trim();
+        let mut isp = parts.get(3).unwrap_or(&"").trim();
+        if isp == "铁通" {
+            isp = "移动";
+        }
+
+        format!("{}{}", country, isp)
+    }
+
+    fn get_relay_server(&self, pa: IpAddr, pb: IpAddr) -> (String, bool) {
         if self.relay_servers.is_empty() {
-            return "".to_owned();
+            return ("".to_owned(), false);
         } else if self.relay_servers.len() == 1 {
-            return self.relay_servers[0].clone();
+            return (self.relay_servers[0].clone(), false);
         }
 
         // 多个中继时才进行判断
-        let hour = Local::now().hour();
-        let is_night = hour >= 18 || hour < 2;
-        let keyword = "shuangqingtech";
-
-        // 根据时间筛选候选服务器
-        let candidates: Vec<_> = if is_night {
-            self.relay_servers
-                .iter()
-                .filter(|x| x.contains(keyword))
-                .collect()
+        let mut candidates: Vec<&String> = Vec::new();
+        let keyword = "alonginwind";
+        let mut force_relay = false;
+        if pa.is_ipv4() && pb.is_ipv4() {
+            let ret1 = self.query_ip(pa);
+            let ret2 = self.query_ip(pb);
+            if ret1 != ret2 {
+                force_relay = true;
+                candidates = self.relay_servers
+                    .iter()
+                    .filter(|x| !x.contains(keyword))
+                    .collect();
+            } else {
+                if ret1 == "中国联通" {
+                    candidates = self.relay_servers
+                        .iter()
+                        .filter(|x| x.contains(keyword))
+                        .collect();
+                } else {
+                    candidates = self.relay_servers
+                        .iter()
+                        .filter(|x| !x.contains(keyword))
+                        .collect();
+                }
+            }
         } else {
-            self.relay_servers
-                .iter()
-                .filter(|x| !x.contains(keyword))
-                .collect()
-        };
+            let hour = Local::now().hour();
+            let is_night = hour >= 18 || hour < 8;
 
-        if candidates.is_empty() {
+            // 根据时间筛选候选服务器
+            candidates = if is_night {
+                self.relay_servers
+                    .iter()
+                    .filter(|x| !x.contains(keyword))
+                    .collect()
+            } else {
+                self.relay_servers
+                    .iter()
+                    .filter(|x| x.contains(keyword))
+                    .collect()
+            };
+        }
+
+        let server = if candidates.is_empty() {
             // 没有匹配时，用全列表轮询
             let i = ROTATION_RELAY_SERVER.fetch_add(1, Ordering::SeqCst) % self.relay_servers.len();
             self.relay_servers[i].clone()
@@ -1204,7 +1247,9 @@ impl RendezvousServer {
             // Vec<&String> → Vec<String>
             let i = ROTATION_RELAY_SERVER.fetch_add(1, Ordering::Relaxed) % candidates.len();
             candidates[i].clone()
-        }
+        };
+
+        (server, force_relay)
     }
 
     async fn check_cmd(&self, cmd: &str) -> String {
@@ -1341,10 +1386,10 @@ impl RendezvousServer {
                     if let Ok(a) = rs.parse::<IpAddr>() {
                         if let Some(rs) = fds.next() {
                             if let Ok(b) = rs.parse::<IpAddr>() {
-                                res = format!("{:?}", self.get_relay_server(a, b));
+                                res = format!("{:?}", self.get_relay_server(a, b).0);
                             }
                         } else {
-                            res = format!("{:?}", self.get_relay_server(a, a));
+                            res = format!("{:?}", self.get_relay_server(a, a).0);
                         }
                     }
                 }
