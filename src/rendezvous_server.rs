@@ -50,6 +50,7 @@ use std::{
 };
 
 use chrono::{Local, Timelike};
+use ip2region::{CachePolicy, Searcher};
 
 #[derive(Clone, Debug)]
 enum Data {
@@ -131,6 +132,7 @@ pub struct RendezvousServer {
     ws_map: Arc<RwLock<HashMap<String, Arc<Mutex<Sink>>>>>,
     addr_peer: Arc<RwLock<HashMap<SocketAddr, String>>>,
     online_cache: Arc<RwLock<HashMap<String, bool>>>,
+    ipv4_searcher: Arc<Searcher>,
 }
 
 enum LoopFailure {
@@ -192,6 +194,7 @@ impl RendezvousServer {
             ws_map: Arc::new(RwLock::new(HashMap::new())),
             addr_peer: Arc::new(RwLock::new(HashMap::new())),
             online_cache: Arc::new(RwLock::new(HashMap::new())),
+            ipv4_searcher: Arc::new(Searcher::new("./ip2region_v4.xdb".to_owned(), CachePolicy::FullMemory).unwrap()),
         };
         log::info!("mask: {:?}", rs.inner.mask);
         log::info!("local-ip: {:?}", rs.inner.local_ip);
@@ -1169,7 +1172,21 @@ impl RendezvousServer {
         self.relay_servers = self.relay_servers0.clone();
     }
 
-    fn get_relay_server(&self, _pa: IpAddr, _pb: IpAddr) -> String {
+    fn query_ip(&self, addr: IpAddr) -> String {
+        let ip = addr.to_string();
+        let record = self.ipv4_searcher.search(ip.as_str()).unwrap_or_default();
+
+        let parts: Vec<&str> = record.split('|').collect();
+        let country = parts.get(0).unwrap_or(&"").trim();
+        let mut isp = parts.get(3).unwrap_or(&"").trim();
+        if isp == "铁通" {
+            isp = "移动";
+        }
+
+        format!("{}{}", country, isp)
+    }
+
+    fn get_relay_server(&self, pa: IpAddr, pb: IpAddr) -> String {
         if self.relay_servers.is_empty() {
             return "".to_owned();
         } else if self.relay_servers.len() == 1 {
@@ -1177,22 +1194,46 @@ impl RendezvousServer {
         }
 
         // 多个中继时才进行判断
-        let hour = Local::now().hour();
-        let is_night = hour >= 18 || hour < 2;
-        let keyword = "shuangqingtech";
-
-        // 根据时间筛选候选服务器
-        let candidates: Vec<_> = if is_night {
-            self.relay_servers
-                .iter()
-                .filter(|x| x.contains(keyword))
-                .collect()
+        let mut candidates: Vec<&String> = Vec::new();
+        let keyword = "alonginwind";
+        if pa.is_ipv4() && pb.is_ipv4() {
+            let ret1 = self.query_ip(pa);
+            let ret2 = self.query_ip(pb);
+            if ret1 != ret2 {
+                candidates = self.relay_servers
+                    .iter()
+                    .filter(|x| !x.contains(keyword))
+                    .collect();
+            } else {
+                if ret1 == "中国联通" {
+                    candidates = self.relay_servers
+                        .iter()
+                        .filter(|x| x.contains(keyword))
+                        .collect();
+                } else {
+                    candidates = self.relay_servers
+                        .iter()
+                        .filter(|x| !x.contains(keyword))
+                        .collect();
+                }
+            }
         } else {
-            self.relay_servers
-                .iter()
-                .filter(|x| !x.contains(keyword))
-                .collect()
-        };
+            let hour = Local::now().hour();
+            let is_night = hour >= 18 || hour < 8;
+
+            // 根据时间筛选候选服务器
+            candidates = if is_night {
+                self.relay_servers
+                    .iter()
+                    .filter(|x| !x.contains(keyword))
+                    .collect()
+            } else {
+                self.relay_servers
+                    .iter()
+                    .filter(|x| x.contains(keyword))
+                    .collect()
+            };
+        }
 
         if candidates.is_empty() {
             // 没有匹配时，用全列表轮询
