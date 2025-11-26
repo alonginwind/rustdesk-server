@@ -576,7 +576,7 @@ impl RendezvousServer {
                             // https://github.com/rustdesk/rustdesk-server/issues/24
                             rr.relay_server = self.inner.local_ip.clone();
                         } else if rr.relay_server == self.inner.local_ip {
-                            rr.relay_server = self.get_relay_server(addr.ip(), addr_b.ip());
+                            rr.relay_server = self.get_relay_server(self.to_ip(addr), self.to_ip(addr_b));
                         }
                     }
                     msg_out.set_relay_response(rr);
@@ -925,6 +925,20 @@ impl RendezvousServer {
     }
 
     #[inline]
+    fn to_ip(&self, addr: SocketAddr) -> IpAddr {
+        match addr.ip() {
+            IpAddr::V4(v4) => IpAddr::V4(v4),
+            IpAddr::V6(v6) => {
+                if let Some(v4) = v6.to_ipv4() {
+                    IpAddr::V4(v4)
+                } else {
+                    IpAddr::V6(v6)
+                }
+            }
+        }
+    }
+
+    #[inline]
     async fn handle_punch_hole_request(
         &mut self,
         addr: SocketAddr,
@@ -995,7 +1009,7 @@ impl RendezvousServer {
             let mut msg_out = RendezvousMessage::new();
             let peer_is_lan = self.is_lan(peer_addr);
             let is_lan = self.is_lan(addr);
-            let mut relay_server = self.get_relay_server(addr.ip(), peer_addr.ip());
+            let mut relay_server = self.get_relay_server(self.to_ip(addr), self.to_ip(peer_addr));
             if ALWAYS_USE_RELAY.load(Ordering::SeqCst) || (peer_is_lan ^ is_lan) {
                 if peer_is_lan {
                     // https://github.com/rustdesk/rustdesk-server/issues/24
@@ -1194,17 +1208,12 @@ impl RendezvousServer {
         }
 
         // 多个中继时才进行判断
-        let mut candidates: Vec<&String> = Vec::new();
+        let candidates: Vec<&String>;
         let keyword = "alonginwind";
         if pa.is_ipv4() && pb.is_ipv4() {
             let ret1 = self.query_ip(pa);
             let ret2 = self.query_ip(pb);
-            if ret1 != ret2 {
-                candidates = self.relay_servers
-                    .iter()
-                    .filter(|x| !x.contains(keyword))
-                    .collect();
-            } else {
+            if ret1 == ret2 && ret1 != "" {
                 if ret1 == "中国联通" {
                     candidates = self.relay_servers
                         .iter()
@@ -1216,6 +1225,11 @@ impl RendezvousServer {
                         .filter(|x| !x.contains(keyword))
                         .collect();
                 }
+            } else {
+                candidates = self.relay_servers
+                    .iter()
+                    .filter(|x| !x.contains(keyword))
+                    .collect();
             }
         } else {
             let hour = Local::now().hour();
@@ -1623,6 +1637,29 @@ impl RendezvousServer {
     }
 }
 
+async fn check_online(
+    online_cache: Arc<RwLock<HashMap<String, bool>>>,
+    pm: Arc<PeerMap>)
+{
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(REG_TIMEOUT as u64 / 2)).await;
+
+        let mut new_cache = HashMap::new();
+        let peer_ids = pm.get_all_ids().await;
+        for id in &peer_ids {
+            if let Some(peer) = pm.get_in_memory(id).await {
+                let elapsed = peer.read().await.last_reg_time.elapsed().as_millis() as i32;
+                new_cache.insert(id.clone(), elapsed < REG_TIMEOUT);
+            } else {
+                new_cache.insert(id.clone(), false);
+            }
+        }
+
+        let mut cache = online_cache.write().await;
+        *cache = new_cache;
+    }
+}
+
 async fn heartbeat_loop(ws_map: Arc<RwLock<HashMap<String, Arc<Mutex<Sink>>>>>) {
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(REG_TIMEOUT as u64 / 2)).await;
@@ -1642,26 +1679,6 @@ async fn heartbeat_loop(ws_map: Arc<RwLock<HashMap<String, Arc<Mutex<Sink>>>>>) 
                         }).await;
                     }
                 });
-            }
-        }
-    }
-}
-
-async fn check_online(
-    online_cache: Arc<RwLock<HashMap<String, bool>>>,
-    pm: Arc<PeerMap>)
-{
-    loop {
-        tokio::time::sleep(std::time::Duration::from_millis(REG_TIMEOUT as u64 / 2)).await;
-
-        let mut cache = online_cache.write().await;
-        let peer_ids = pm.get_all_ids().await;
-        for id in &peer_ids {
-            if let Some(peer) = pm.get_in_memory(id).await {
-                let elapsed = peer.read().await.last_reg_time.elapsed().as_millis() as i32;
-                cache.insert(id.clone(), elapsed < REG_TIMEOUT);
-            } else {
-                cache.insert(id.clone(), false);
             }
         }
     }
