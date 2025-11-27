@@ -960,7 +960,7 @@ impl RendezvousServer {
             if ph.token.is_empty() {
                 let mut msg_out = RendezvousMessage::new();
                 msg_out.set_punch_hole_response(PunchHoleResponse {
-                    other_failure: String::from("Connection failed, please login!"),
+                    other_failure: String::from("请登录!"),
                     ..Default::default()
                 });
                 return Ok((msg_out, None));
@@ -971,7 +971,7 @@ impl RendezvousServer {
                     let mut msg_out = RendezvousMessage::new();
                     msg_out.set_punch_hole_response(PunchHoleResponse {
                         //提示重新登录
-                        other_failure: String::from("Token error, please log out and log back in!"),
+                        other_failure: String::from("登录过期，请重新登录!"),
                         ..Default::default()
                     });
                     return Ok((msg_out, None));
@@ -981,7 +981,7 @@ impl RendezvousServer {
             if !Self::test_user("http://127.0.0.1:21114", token.as_str()).await {
                 let mut msg_out = RendezvousMessage::new();
                 msg_out.set_punch_hole_response(PunchHoleResponse {
-                    other_failure: String::from("Token error, please log in!"),
+                    other_failure: String::from("强制退出，请重新登录!"),
                     ..Default::default()
                 });
                 return Ok((msg_out, None));
@@ -1208,52 +1208,48 @@ impl RendezvousServer {
         }
 
         // 多个中继时才进行判断
-        let candidates: Vec<&String>;
-        let keyword = "alonginwind";
+        let keyword = "shuangqingtech";
         let mut force_relay = false;
-        if pa.is_ipv4() && pb.is_ipv4() {
-            let ret1 = self.query_ip(pa);
-            let ret2 = self.query_ip(pb);
-            if ret1 == ret2 && ret1 != "" {
-                if ret1 == "中国联通" {
-                    candidates = self.relay_servers
+        let candidates: Vec<&String> = if pa.is_ipv4() && pb.is_ipv4() {
+            let isp1 = self.query_ip(pa);
+            let isp2 = self.query_ip(pb);
+            if isp1 == isp2 && !isp1.is_empty() {
+                let mut list: Vec<&String> = self.relay_servers
+                    .iter()
+                    .filter(|x| x.contains(match isp1.as_str() {
+                        "中国联通" => "unicom",
+                        "中国电信" => "telecom",
+                        "中国移动" => "mobile",
+                        _ => keyword,
+                    }))
+                    .collect();
+                if list.is_empty() {
+                    list = self.relay_servers
                         .iter()
                         .filter(|x| x.contains(keyword))
                         .collect();
-                } else {
-                    candidates = self.relay_servers
-                        .iter()
-                        .filter(|x| !x.contains(keyword))
-                        .collect();
                 }
+                list
             } else {
                 force_relay = true;
-                candidates = self.relay_servers
-                    .iter()
-                    .filter(|x| !x.contains(keyword))
-                    .collect();
-            }
-        } else {
-            let hour = Local::now().hour();
-            let is_night = hour >= 18 || hour < 8;
-
-            // 根据时间筛选候选服务器
-            candidates = if is_night {
-                self.relay_servers
-                    .iter()
-                    .filter(|x| !x.contains(keyword))
-                    .collect()
-            } else {
                 self.relay_servers
                     .iter()
                     .filter(|x| x.contains(keyword))
                     .collect()
-            };
-        }
+            }
+        } else {
+            let hour = Local::now().hour();
+            let is_night = hour >= 18 || hour < 8;
+            // 根据时间筛选候选服务器
+            self.relay_servers
+                .iter()
+                .filter(|x| x.contains(keyword) == is_night)
+                .collect()
+        };
 
         let server = if candidates.is_empty() {
             // 没有匹配时，用全列表轮询
-            let i = ROTATION_RELAY_SERVER.fetch_add(1, Ordering::SeqCst) % self.relay_servers.len();
+            let i = ROTATION_RELAY_SERVER.fetch_add(1, Ordering::Relaxed) % self.relay_servers.len();
             self.relay_servers[i].clone()
         } else if candidates.len() == 1 {
             candidates[0].clone()
