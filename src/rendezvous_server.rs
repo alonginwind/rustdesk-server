@@ -925,6 +925,20 @@ impl RendezvousServer {
     }
 
     #[inline]
+    async fn query_share_peer(api_url: &str, peer_id: &str) -> bool {
+        let url = format!("{}/api/query-share-peer?peer_id={}", api_url, peer_id);
+        let client = reqwest::Client::new();
+        if let Ok(resp) = client.get(&url)
+            .header("Accept", "application/json")
+            .send().await {
+                if let Ok(json) = resp.json::<serde_json::Value>().await {
+                    return json["code"].as_i64().unwrap_or(101) == 0;
+                }
+        }
+        false
+    }
+
+    #[inline]
     fn to_ip(&self, addr: SocketAddr) -> IpAddr {
         match addr.ip() {
             IpAddr::V4(v4) => IpAddr::V4(v4),
@@ -955,8 +969,11 @@ impl RendezvousServer {
             });
             return Ok((msg_out, None));
         }
+        // 判断是否分享id
+        let id = ph.id;
+        let is_shared = Self::query_share_peer("http://127.0.0.1:21114", id.as_str()).await;
         // if secret is not empty check token by jwt
-        if MUST_LOGIN.load(Ordering::SeqCst) {
+        if !is_shared && MUST_LOGIN.load(Ordering::SeqCst) {
             if ph.token.is_empty() {
                 let mut msg_out = RendezvousMessage::new();
                 msg_out.set_punch_hole_response(PunchHoleResponse {
@@ -987,7 +1004,6 @@ impl RendezvousServer {
                 return Ok((msg_out, None));
             }
         }
-        let id = ph.id;
         // punch hole request from A, relay to B,
         // check if in same intranet first,
         // fetch local addrs if in same intranet.
