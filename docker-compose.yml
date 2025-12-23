@@ -11,7 +11,7 @@ services:
       - 21117:21117
       - 21118:21118
       - 21119:21119
-    image: lejianwen/rustdesk-server-s6:latest
+    image: alonginwind/rustdesk-server-s6:latest
     environment:
       - RELAY=<relay_server[:port]>
       - ENCRYPTED_ONLY=1

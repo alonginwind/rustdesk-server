@@ -1,9 +1,10 @@
-FROM lejianwen/rustdesk-api:latest
+FROM alonginwind/rustdesk-api:latest
 
 ARG S6_OVERLAY_VERSION=3.2.0.0
 ARG S6_ARCH=x86_64
 ADD https://github.com/just-containers/s6-overlay/releases/download/v${S6_OVERLAY_VERSION}/s6-overlay-noarch.tar.xz /tmp
 ADD https://github.com/just-containers/s6-overlay/releases/download/v${S6_OVERLAY_VERSION}/s6-overlay-${S6_ARCH}.tar.xz /tmp
+ADD https://raw.githubusercontent.com/alonginwind/ip2region/refs/heads/master/data/ip2region_v4.xdb /ip2region_v4.xdb
 RUN \
   tar -C / -Jxpf /tmp/s6-overlay-noarch.tar.xz && \
   tar -C / -Jxpf /tmp/s6-overlay-${S6_ARCH}.tar.xz && \
