@@ -1209,7 +1209,11 @@ impl RendezvousServer {
         let parts: Vec<&str> = record.split('|').collect();
         let country = parts.get(0).unwrap_or(&"").trim();
         let mut isp = parts.get(3).unwrap_or(&"").trim();
-        if isp == "铁通" {
+        if isp.contains("电信") {
+            isp = "电信";
+        } else if isp.contains("联通") {
+            isp = "联通";
+        } else if isp.contains("铁通") || isp.contains("移动") {
             isp = "移动";
         }
 
