@@ -202,9 +202,10 @@ jobs:
           zip ${{ matrix.job.name }}/rustdesk-server-${{ matrix.job.os }}-${{ matrix.job.name }}${{ matrix.job.suffix }}.zip ${{ matrix.job.name }}/*
 
       - name: Create Release (${{ matrix.job.os }} - (${{ matrix.job.name }})
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v3
         with:
           draft: false
+          update_existing: true
           files: ${{ matrix.job.name }}/rustdesk-server-${{ matrix.job.os }}-${{ matrix.job.name }}${{ matrix.job.suffix }}.zip
             
   # docker build and push of single-arch images
@@ -305,7 +306,7 @@ jobs:
       # manifest for :1.2.3 tag
       #  this has to run only if invoked by a new tag
       - name: Create and push manifest (:ve.rs.ion)
-        uses: Noelware/docker-manifest-action@master
+        uses: Noelware/docker-manifest-action@1.0.0
         with:
           tags: ${{ secrets.DOCKER_IMAGE }}:${{ env.GIT_TAG }}
           inputs: |
@@ -317,7 +318,7 @@ jobs:
 
       # manifest for :1 tag (major release)
       - name: Create and push manifest (:major)
-        uses: Noelware/docker-manifest-action@master
+        uses: Noelware/docker-manifest-action@1.0.0
         with:
           tags: ${{ secrets.DOCKER_IMAGE }}:${{ env.MAJOR_TAG }}
           inputs: |
@@ -329,7 +330,7 @@ jobs:
 
       # manifest for :latest tag
       - name: Create and push manifest (:latest)
-        uses: Noelware/docker-manifest-action@master
+        uses: Noelware/docker-manifest-action@1.0.0
         with:
           tags: ${{ secrets.DOCKER_IMAGE }}:${{ env.LATEST_TAG }}
           inputs: |
@@ -436,7 +437,7 @@ jobs:
       # manifest for :1.2.3 tag
       #  this has to run only if invoked by a new tag
       - name: Create and push manifest (:ve.rs.ion)
-        uses: Noelware/docker-manifest-action@master
+        uses: Noelware/docker-manifest-action@1.0.0
         if: github.event_name != 'workflow_dispatch'
         with:
           tags: ${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.GIT_TAG }}
@@ -445,7 +446,7 @@ jobs:
 
       # manifest for :1 tag (major release)
       - name: Create and push manifest (:major)
-        uses: Noelware/docker-manifest-action@master
+        uses: Noelware/docker-manifest-action@1.0.0
         with:
           tags: ${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.MAJOR_TAG }}
           inputs: ${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.MAJOR_TAG }}-amd64,${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.MAJOR_TAG }}-arm64v8,${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.MAJOR_TAG }}-armv7
@@ -453,7 +454,7 @@ jobs:
 
       # manifest for :latest tag
       - name: Create and push manifest (:latest)
-        uses: Noelware/docker-manifest-action@master
+        uses: Noelware/docker-manifest-action@1.0.0
         with:
           tags: ${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.LATEST_TAG }}
           inputs: ${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.LATEST_TAG }}-amd64,${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.LATEST_TAG }}-arm64v8,${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.LATEST_TAG }}-armv7
@@ -505,9 +506,10 @@ jobs:
           debuild -i -us -uc -b -a${{ matrix.job.debian_platform }}
 
       - name: Create Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v3
         with:
           draft: false
+          update_existing: true
           files: |
             debian-build/rustdesk-server-hbbr_*_${{ matrix.job.debian_platform }}.deb
             debian-build/rustdesk-server-hbbs_*_${{ matrix.job.debian_platform }}.deb
