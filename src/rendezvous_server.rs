@@ -923,8 +923,13 @@ impl RendezvousServer {
     }
 
     #[inline]
-    async fn query_share_peer(api_url: &str, peer_id: &str) -> bool {
-        let url = format!("{}/api/query-share-peer?peer_id={}", api_url, peer_id);
+    async fn query_share_peer(api_url: &str, peer_id: &str, conn_type: ConnType) -> bool {
+        let conn_type_str = match conn_type {
+            ConnType::FILE_TRANSFER => "file_transfer",
+            ConnType::TERMINAL => "terminal",
+            _ => "default_conn",
+        };
+        let url = format!("{}/api/query-share-peer?peer_id={}&conn_type={}", api_url, peer_id, conn_type_str);
         let client = reqwest::Client::new();
         if let Ok(resp) = client.get(&url)
             .header("Accept", "application/json")
@@ -969,7 +974,8 @@ impl RendezvousServer {
         }
         // 判断是否分享id
         let id = ph.id;
-        let is_shared = Self::query_share_peer("http://127.0.0.1:21114", id.as_str()).await;
+        let conn_type = ph.conn_type.enum_value_or(ConnType::DEFAULT_CONN);
+        let is_shared = Self::query_share_peer("http://127.0.0.1:21114", id.as_str(), conn_type).await;
         // if secret is not empty check token by jwt
         if !is_shared && MUST_LOGIN.load(Ordering::SeqCst) {
             if ph.token.is_empty() {
