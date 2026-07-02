@@ -1,6 +1,8 @@
 #!/command/with-contenv sh
 sleep 2
 cd /data
+# Copy ip2region database from image to volume
+[ -f /ip2region_v4.xdb ] && cp /ip2region_v4.xdb /data/ip2region_v4.xdb
 PARAMS=
 [ "${ENCRYPTED_ONLY}" = "1" ] && PARAMS="-k _"
 /usr/bin/hbbs -r $RELAY $PARAMS
