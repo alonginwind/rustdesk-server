@@ -405,11 +405,17 @@ async fn make_pair(
                 .get("X-Real-IP")
                 .or_else(|| headers.get("X-Forwarded-For"))
                 .and_then(|header_value| header_value.to_str().ok());
+            let real_port = headers
+                .get("X-Real-Port")
+                .and_then(|header_value| header_value.to_str().ok());
             if let Some(ip) = real_ip {
+                let port = real_port
+                    .and_then(|p| p.parse::<u16>().ok())
+                    .unwrap_or(0);
                 if ip.contains('.') {
-                    addr = format!("{ip}:0").parse().unwrap_or(addr);
+                    addr = format!("{ip}:{port}").parse().unwrap_or(addr);
                 } else {
-                    addr = format!("[{ip}]:0").parse().unwrap_or(addr);
+                    addr = format!("[{ip}]:{port}").parse().unwrap_or(addr);
                 }
             }
             Ok(response)
