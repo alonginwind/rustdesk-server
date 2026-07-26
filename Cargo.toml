@@ -1,6 +1,6 @@
 [package]
 name = "hbbs"
-version = "1.1.16"
+version = "1.1.17"
 authors = ["rustdesk <info@rustdesk.com>"]
 edition = "2021"
 build = "build.rs"
@@ -52,6 +52,8 @@ local-ip-address = "0.5.1"
 dns-lookup = "1.0.8"
 ping = "0.4.0"
 ip2region = { git = "https://github.com/lionsoul2014/ip2region.git", branch = "master" }
+# Build openssl from source so cross-compilation (musl containers) works without system libssl-dev
+openssl-sys = { version = "0.9", features = ["vendored"] }
 
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
 # https://github.com/rustdesk/rustdesk-server-pro/issues/189, using native-tls for better tls support
@@ -62,6 +64,7 @@ reqwest = { git = "https://github.com/rustdesk-org/reqwest", features = ["blocki
 
 [build-dependencies]
 hbb_common = { path = "libs/hbb_common" }
+openssl-sys = { version = "0.9", features = ["vendored"] }
 
 [workspace]
 members = ["libs/hbb_common"]
