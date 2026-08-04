@@ -1716,6 +1716,8 @@ async fn heartbeat_loop(conn_map: Arc<RwLock<HashMap<SocketAddr, Arc<Mutex<(Sink
                     }
                 });
             }
+            // Wait for a bit before sending the next chunk
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     }
 }
