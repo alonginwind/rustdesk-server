@@ -130,7 +130,6 @@ pub struct RendezvousServer {
     rendezvous_servers: Arc<Vec<String>>,
     inner: Arc<Inner>,
     conn_map: Arc<RwLock<HashMap<SocketAddr, Arc<Mutex<(Sink, String)>>>>>,
-    online_cache: Arc<RwLock<HashMap<String, bool>>>,
     ipv4_searcher: Arc<Searcher>,
 }
 
@@ -191,7 +190,6 @@ impl RendezvousServer {
                 secure_tcp_sk_b,
             }),
             conn_map: Arc::new(RwLock::new(HashMap::new())),
-            online_cache: Arc::new(RwLock::new(HashMap::new())),
             ipv4_searcher: Arc::new(Searcher::new("./ip2region_v4.xdb".to_owned(), CachePolicy::FullMemory).unwrap()),
         };
         log::info!("mask: {:?}", rs.inner.mask);
@@ -260,11 +258,6 @@ impl RendezvousServer {
                 }
             });
         };
-        let online_cache = rs.online_cache.clone();
-        let pm = Arc::new(rs.pm.clone());
-        tokio::spawn(async move {
-            check_online(online_cache, pm).await;
-        });
         let conn_map = rs.conn_map.clone();
         tokio::spawn(async move {
             heartbeat_loop(conn_map).await;
@@ -681,18 +674,16 @@ impl RendezvousServer {
 
     #[inline]
     async fn peers_online_state(&mut self, peers: Vec<String>) -> BytesMut {
-        let online_state = {
-            let state = self.online_cache.read().await;
-            state.clone()
-        };
         let mut states = BytesMut::zeroed((peers.len() + 7) / 8);
         for (i, peer_id) in peers.iter().enumerate() {
-            let is_online = online_state.get(peer_id).copied().unwrap_or(false);
-            // bytes index from left to right
-            let states_idx = i / 8;
-            let bit_idx = 7 - i % 8;
-            if is_online {
-                states[states_idx] |= 0x01 << bit_idx;
+            if let Some(peer) = self.pm.get_in_memory(peer_id).await {
+                let elapsed = peer.read().await.last_reg_time.elapsed().as_millis() as i64;
+                // bytes index from left to right
+                let states_idx = i / 8;
+                let bit_idx = 7 - i % 8;
+                if elapsed < REG_TIMEOUT {
+                    states[states_idx] |= 0x01 << bit_idx;
+                }
             }
         }
         states
@@ -1670,29 +1661,6 @@ impl RendezvousServer {
             }
             None => {}
         }
-    }
-}
-
-async fn check_online(
-    online_cache: Arc<RwLock<HashMap<String, bool>>>,
-    pm: Arc<PeerMap>)
-{
-    loop {
-        tokio::time::sleep(std::time::Duration::from_millis(REG_TIMEOUT as u64 / 2)).await;
-
-        let mut new_cache = HashMap::new();
-        let peer_ids = pm.get_all_ids().await;
-        for id in &peer_ids {
-            if let Some(peer) = pm.get_in_memory(id).await {
-                let elapsed = peer.read().await.last_reg_time.elapsed().as_millis() as i64;
-                new_cache.insert(id.clone(), elapsed < REG_TIMEOUT);
-            } else {
-                new_cache.insert(id.clone(), false);
-            }
-        }
-
-        let mut cache = online_cache.write().await;
-        *cache = new_cache;
     }
 }
 

@@ -177,10 +177,4 @@ impl PeerMap {
     pub(crate) async fn is_in_memory(&self, id: &str) -> bool {
         self.map.read().await.contains_key(id)
     }
-
-    #[inline]
-    pub(crate) async fn get_all_ids(&self) -> Vec<String> {
-        let map = self.map.read().await;
-        map.keys().cloned().collect()
-    }
 }
