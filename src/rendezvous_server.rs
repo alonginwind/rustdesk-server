@@ -339,6 +339,10 @@ impl RendezvousServer {
                             }
                         }
                         Some(Err(err)) => {
+                            if is_ignorable_udp_error(&err) {
+                                log::debug!("udp ignorable failure: {}", err);
+                                continue;
+                            }
                             log::error!("udp failure: {}", err);
                             return LoopFailure::UdpSocket;
                         }
@@ -1767,6 +1771,29 @@ async fn send_rk_res(
         ..Default::default()
     });
     socket.send(&msg_out, addr).await
+}
+
+// Windows converts the ICMP "port unreachable" triggered by a previous udp send into
+// WSAECONNRESET(10054) and reports it on the next recv/send of the same socket, while linux
+// discards such ICMP silently. These errors tell nothing about our own socket, recreating it
+// only drops the packets arriving in between, so just ignore them as linux does.
+fn is_ignorable_udp_error(err: &hbb_common::anyhow::Error) -> bool {
+    match err.downcast_ref::<Error>() {
+        Some(err) => {
+            matches!(
+                err.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionAborted
+            )
+                // WSAECONNRESET
+                || matches!(
+                    err.raw_os_error(),
+                    Some(10054)
+                )
+        }
+        None => false,
+    }
 }
 
 async fn create_udp_listener(port: i32, rmem: usize) -> ResultType<FramedSocket> {
