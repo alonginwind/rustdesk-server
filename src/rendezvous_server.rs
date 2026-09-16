@@ -122,7 +122,7 @@ struct Inner {
 
 #[derive(Clone)]
 pub struct RendezvousServer {
-    tcp_punch: Arc<Mutex<HashMap<SocketAddr, Sink>>>,
+    tcp_punch: Arc<Mutex<HashMap<SocketAddr, Arc<Mutex<Sink>>>>>,
     pm: PeerMap,
     tx: Sender,
     relay_servers: Arc<RelayServers>,
@@ -528,7 +528,10 @@ impl RendezvousServer {
                 Some(rendezvous_message::Union::PunchHoleRequest(ph)) => {
                     // there maybe several attempt, so sink can be none
                     if let Some(sink) = sink.take() {
-                        self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
+                        self.tcp_punch
+                            .lock()
+                            .await
+                            .insert(try_into_v4(addr), Arc::new(Mutex::new(sink)));
                     }
                     allow_err!(self.handle_tcp_punch_hole_request(addr, ph, key, ws).await);
                     return true;
@@ -536,7 +539,10 @@ impl RendezvousServer {
                 Some(rendezvous_message::Union::RequestRelay(mut rf)) => {
                     // there maybe several attempt, so sink can be none
                     if let Some(sink) = sink.take() {
-                        self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
+                        self.tcp_punch
+                            .lock()
+                            .await
+                            .insert(try_into_v4(addr), Arc::new(Mutex::new(sink)));
                     }
                     if let Some(peer) = self.pm.get_in_memory(&rf.id).await {
                         let mut msg_out = RendezvousMessage::new();
@@ -656,6 +662,11 @@ impl RendezvousServer {
                         ..Default::default()
                     });
                     Self::send_to_sink(sink, msg_out).await;
+                }
+                Some(rendezvous_message::Union::IceCandidate(ice)) => {
+                    allow_err!(self.handle_ice_candidate(ice, addr).await);
+                    // the connection is the ICE bridge route, keep it open for the trickle
+                    return true;
                 }
                 _ => {
                     if bytes.is_empty() {
@@ -848,6 +859,8 @@ impl RendezvousServer {
             socket_addr: AddrMangle::encode(addr).into(),
             pk: self.get_pk(&phs.version, phs.id).await,
             relay_server: phs.relay_server.clone(),
+            socket_addr_v6: phs.socket_addr_v6,
+            webrtc_sdp_answer: phs.webrtc_sdp_answer,
             ..Default::default()
         };
         if let Ok(t) = phs.nat_type.enum_value() {
@@ -882,6 +895,7 @@ impl RendezvousServer {
             socket_addr: la.local_addr.clone(),
             pk: self.get_pk(&la.version, la.id).await,
             relay_server: la.relay_server,
+            socket_addr_v6: la.socket_addr_v6,
             ..Default::default()
         };
         p.set_is_local(true);
@@ -1043,6 +1057,7 @@ impl RendezvousServer {
                 msg_out.set_fetch_local_addr(FetchLocalAddr {
                     socket_addr,
                     relay_server,
+                    socket_addr_v6: ph.socket_addr_v6,
                     ..Default::default()
                 });
             } else {
@@ -1056,6 +1071,9 @@ impl RendezvousServer {
                     socket_addr,
                     nat_type: ph.nat_type,
                     relay_server,
+                    force_relay: ph.force_relay,
+                    socket_addr_v6: ph.socket_addr_v6,
+                    webrtc_sdp_offer: ph.webrtc_sdp_offer,
                     ..Default::default()
                 });
             }
@@ -1098,10 +1116,14 @@ impl RendezvousServer {
             return;
         }
 
-        let mut tcp = self.tcp_punch.lock().await.remove(&try_into_v4(addr));
-        tokio::spawn(async move {
-            Self::send_to_sink(&mut tcp, msg).await;
-        });
+        // the sink stays for later punch attempts on the same socket and the ICE bridge echo
+        let tcp = self.tcp_punch.lock().await.get(&try_into_v4(addr)).cloned();
+        if let Some(tcp) = tcp {
+            tokio::spawn(async move {
+                let mut tcp = tcp.lock().await;
+                tcp.send(&msg).await;
+            });
+        }
     }
 
     #[inline]
@@ -1125,8 +1147,57 @@ impl RendezvousServer {
             return Ok(());
         }
 
-        let mut sink = self.tcp_punch.lock().await.remove(&try_into_v4(addr));
-        Self::send_to_sink(&mut sink, msg).await;
+        let tcp = self.tcp_punch.lock().await.get(&try_into_v4(addr)).cloned();
+        if let Some(tcp) = tcp {
+            let mut tcp = tcp.lock().await;
+            tcp.send(&msg).await;
+        }
+        Ok(())
+    }
+
+    #[inline]
+    async fn handle_ice_candidate(
+        &mut self,
+        ice: IceCandidate,
+        addr: SocketAddr,
+    ) -> ResultType<()> {
+        // the controlled side echoes the controller's punch/relay socket address back,
+        // while the controller only carries the controlled side's id
+        let target = if !ice.socket_addr.is_empty() {
+            Some(AddrMangle::decode(&ice.socket_addr))
+        } else if !ice.id.is_empty() {
+            match self.pm.get_in_memory(&ice.id).await {
+                Some(peer) => {
+                    let peer = peer.read().await;
+                    Some(peer.socket_addr)
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        let Some(target) = target else {
+            log::debug!(
+                "IceCandidate from {:?} dropped, no route (id: {:?})",
+                addr,
+                ice.id
+            );
+            return Ok(());
+        };
+        let target = try_into_v4(target);
+        let mut msg_out = RendezvousMessage::new();
+        msg_out.set_ice_candidate(ice);
+        if let Some(sink_arc) = self.conn_map.read().await.get(&target).cloned() {
+            let mut sink = sink_arc.lock().await;
+            sink.0.send(&msg_out).await;
+            return Ok(());
+        }
+        if let Some(tcp) = self.tcp_punch.lock().await.get(&target).cloned() {
+            let mut tcp = tcp.lock().await;
+            tcp.send(&msg_out).await;
+            return Ok(());
+        }
+        self.tx.send(Data::Msg(msg_out.into(), target)).ok();
         Ok(())
     }
 
