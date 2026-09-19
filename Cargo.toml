@@ -25,7 +25,7 @@ lazy_static = "1.4"
 clap = "2"
 rust-ini = "0.18"
 minreq = { version = "2.4", features = ["punycode"] }
-machine-uid = "0.2"
+machine-uid = { git = "https://github.com/rustdesk-org/machine-uid" }
 mac_address = "1.1.5"
 whoami = "1.2"
 base64 = "0.13"
@@ -63,7 +63,7 @@ reqwest = { git = "https://github.com/rustdesk-org/reqwest", features = ["blocki
 reqwest = { git = "https://github.com/rustdesk-org/reqwest", features = ["blocking", "socks", "json", "rustls-tls", "rustls-tls-native-roots", "gzip"], default-features=false }
 
 [build-dependencies]
-hbb_common = { path = "libs/hbb_common" }
+chrono = "0.4"
 openssl-sys = { version = "0.9", features = ["vendored"] }
 
 [workspace]
@@ -79,3 +79,8 @@ panic = 'abort'
 strip = true
 #opt-level = 'z' # only have smaller size after strip # Default is 3, better performance
 #rpath = true # Not needed
+
+# Patch machine-uid to fix cross-compilation: build.rs used cfg(target_os) which
+# checks host OS in build scripts; replaced with CARGO_CFG_TARGET_OS.
+[patch."https://github.com/rustdesk-org/machine-uid"]
+machine-uid = { path = "patches/machine-uid" }
