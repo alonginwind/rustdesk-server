@@ -1494,7 +1494,7 @@ dependencies = [
  "libloading",
  "log",
  "mac_address",
- "machine-uid 0.3.0",
+ "machine-uid",
  "percent-encoding",
  "protobuf",
  "protobuf-codegen",
@@ -1553,7 +1553,7 @@ dependencies = [
  "lazy_static",
  "local-ip-address",
  "mac_address",
- "machine-uid 0.2.0",
+ "machine-uid",
  "minreq",
  "once_cell",
  "openssl-sys",
@@ -2294,17 +2294,7 @@ dependencies = [
 
 [[package]]
 name = "machine-uid"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1f1595709b0a7386bcd56ba34d250d626e5503917d05d32cdccddcd68603e212"
-dependencies = [
- "winreg 0.6.2",
-]
-
-[[package]]
-name = "machine-uid"
 version = "0.3.0"
-source = "git+https://github.com/rustdesk-org/machine-uid#381ff579c1dc3a6c54db9dfec47c44bcb0246542"
 dependencies = [
  "bindgen",
  "cc",
@@ -5782,15 +5772,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f593a95398737aeed53e489c785df13f3618e41dbcd6718c6addbf1395aa6876"
 dependencies = [
  "memchr",
-]
-
-[[package]]
-name = "winreg"
-version = "0.6.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b2986deb581c4fe11b621998a5e53361efe6b48a151178d0cd9eeffa4dc6acc9"
-dependencies = [
- "winapi",
 ]
 
 [[package]]
