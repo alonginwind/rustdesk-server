@@ -1618,14 +1618,22 @@ impl RendezvousServer {
             if !key.is_empty() {
                 self.key_exchange_phase1(addr, &mut sink).await;
             }
+            // The sink also holds the decrypt key, but PunchHoleRequest / RequestRelay move it into
+            // tcp_punch for address-based response routing. Keep an independent key copy so this loop
+            // can still decrypt the controller's later encrypted ICE candidates; otherwise they fail
+            // to parse, handle_tcp returns false, and the connection (and remaining candidates) dies.
+            let mut dec: Option<Encrypt> = None;
             while let Ok(Some(Ok(mut bytes))) = timeout(REG_TIMEOUT as u64, b.next()).await {
                 // log::debug!("receive tcp data from {:?} {:?}", addr, bytes);
-                if let Some(Sink::Tss(s)) = sink.as_mut() {
-                    if let Some(key) = s.encrypt.as_mut() {
-                        if let Err(err) = key.dec(&mut bytes) {
-                            log::error!("dec tcp data from {:?} err: {:?}", addr, err);
-                            break;
-                        }
+                if dec.is_none() {
+                    if let Some(Sink::Tss(s)) = sink.as_mut() {
+                        dec = s.encrypt.clone();
+                    }
+                }
+                if let Some(key) = dec.as_mut() {
+                    if let Err(err) = key.dec(&mut bytes) {
+                        log::error!("dec tcp data from {:?} err: {:?}", addr, err);
+                        break;
                     }
                 }
                 if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
