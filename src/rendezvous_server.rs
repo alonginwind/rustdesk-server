@@ -60,6 +60,19 @@ enum Data {
 }
 
 const REG_TIMEOUT: i64 = 30_000;
+/// Window for per-id heartbeat source-address statistics used by duplicate
+/// id detection.
+/// All heartbeat paths (UDP RegisterPeer and WS/TCP echo) beat every 15s, so
+/// this is 20 beats per source; long enough to ride out packet loss and
+/// short reconnects, short enough that a roaming stale count ages out soon.
+const SOURCE_IP_WINDOW: Duration = Duration::from_secs(300);
+/// A source address silent for ~2.7 heartbeat periods (40s — roomy enough to
+/// ride out a delayed or lost beat on weak links) is considered gone — e.g.
+/// the device switched networks or its socket was rebuilt on reconnect — and
+/// is dropped from the stats, so neither can look like a duplicate id. The
+/// detection threshold (>4, 5 beats ≈ 75s) guarantees the newest address
+/// only reaches it after this expiry has already evicted the previous one.
+const SOURCE_IP_EXPIRE: Duration = Duration::from_secs(40);
 type TcpStreamSink = SplitSink<Framed<TcpStream, BytesCodec>, Bytes>;
 type WsSink = SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, tungstenite::Message>;
 struct SafeWsSink {
@@ -120,6 +133,62 @@ struct Inner {
     secure_tcp_sk_b: SecretKey,
 }
 
+/// Heartbeat source-address statistics of a peer id inside the current
+/// window. Two different addresses each counting more than four heartbeats
+/// means the id is online from multiple machines at the same time (duplicate
+/// id). Addresses that stopped beating for SOURCE_IP_EXPIRE are dropped, so
+/// a network switch (or a socket rebuild on reconnect) leaves only the new
+/// address counted. The full SocketAddr is used instead of the bare IP so
+/// that two machines behind the same NAT are still told apart by their
+/// mapped ports (only one heartbeat channel is alive at a time).
+#[derive(Default)]
+struct IpStats {
+    window_start: Option<Instant>,
+    warned: bool,
+    counts: HashMap<SocketAddr, (u32, Instant)>,
+}
+
+impl IpStats {
+    /// Count one heartbeat from addr. Returns Some(the duplicate addresses)
+    /// the first time in the window that two or more addresses have both
+    /// counted more than four heartbeats, None otherwise.
+    fn record(&mut self, addr: SocketAddr) -> Option<Vec<SocketAddr>> {
+        let now = Instant::now();
+        if self
+            .window_start
+            .map(|t| now.duration_since(t) >= SOURCE_IP_WINDOW)
+            .unwrap_or(true)
+        {
+            self.counts.clear();
+            self.warned = false;
+            self.window_start = Some(now);
+        }
+        // Drop addresses silent for two heartbeat periods: they are gone
+        // (network switch, socket rebuild), not part of a live duplicate id.
+        self.counts
+            .retain(|_, (_, last)| now.duration_since(*last) < SOURCE_IP_EXPIRE);
+        let entry = self.counts.entry(addr).or_insert((0, now));
+        entry.0 += 1;
+        entry.1 = now;
+        if self.warned {
+            return None;
+        }
+        let mut duplicates: Vec<SocketAddr> = self
+            .counts
+            .iter()
+            .filter(|(_, (c, _))| *c > 4)
+            .map(|(a, _)| *a)
+            .collect();
+        if duplicates.len() >= 2 {
+            duplicates.sort();
+            self.warned = true;
+            Some(duplicates)
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct RendezvousServer {
     tcp_punch: Arc<Mutex<HashMap<SocketAddr, Arc<Mutex<Sink>>>>>,
@@ -130,6 +199,7 @@ pub struct RendezvousServer {
     rendezvous_servers: Arc<Vec<String>>,
     inner: Arc<Inner>,
     conn_map: Arc<RwLock<HashMap<SocketAddr, Arc<Mutex<(Sink, String)>>>>>,
+    id_ips: Arc<Mutex<HashMap<String, IpStats>>>,
     ipv4_searcher: Arc<Searcher>,
 }
 
@@ -190,6 +260,7 @@ impl RendezvousServer {
                 secure_tcp_sk_b,
             }),
             conn_map: Arc::new(RwLock::new(HashMap::new())),
+            id_ips: Arc::new(Mutex::new(HashMap::new())),
             ipv4_searcher: Arc::new(Searcher::new("./ip2region_v4.xdb".to_owned(), CachePolicy::FullMemory).unwrap()),
         };
         log::info!("mask: {:?}", rs.inner.mask);
@@ -674,6 +745,7 @@ impl RendezvousServer {
                         if let Some(sink) = self.conn_map.read().await.get(&addr_v4) {
                             let peer_id = sink.lock().await.1.clone();
                             if !peer_id.is_empty() {
+                                self.record_peer_ip(&peer_id, addr).await;
                                 if let Some(peer) = self.pm.get_in_memory(&peer_id).await {
                                     peer.write().await.last_reg_time = Instant::now();
                                     return true;
@@ -799,8 +871,33 @@ impl RendezvousServer {
         // Ok(msg_out)
     }
 
+    /// Track the heartbeat source address of a peer id and warn when the id
+    /// has been online from multiple addresses in the window (duplicate id).
+    async fn record_peer_ip(&self, id: &str, addr: SocketAddr) {
+        if let Some(duplicates) = self
+            .id_ips
+            .lock()
+            .await
+            .entry(id.to_owned())
+            .or_default()
+            .record(addr)
+        {
+            log::warn!(
+                "Peer {} duplicate id: online from {} different addresses: {}",
+                id,
+                duplicates.len(),
+                duplicates
+                    .iter()
+                    .map(|a| a.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    }
+
     #[inline]
     async fn update_addr(&mut self, id: String, socket_addr: SocketAddr) -> bool {
+        self.record_peer_ip(&id, socket_addr).await;
         let (request_pk, ip_change) = if let Some(old) = self.pm.get_in_memory(&id).await {
             let mut old = old.write().await;
             let ip = socket_addr.ip();
