@@ -18,6 +18,111 @@ pub(crate) fn get_expired_time() -> Instant {
         .unwrap_or(now)
 }
 
+/// Secondary log writer that keeps an append-only, never-rotated copy of
+/// WARN-and-above log lines, so errors and alerts survive the 7-file
+/// rotation of the regular log. Raise the level check to `Error` only if
+/// warnings should stay in the regular log only.
+struct ErrorLevelWriter {
+    inner: flexi_logger::writers::FileLogWriter,
+}
+
+impl flexi_logger::writers::LogWriter for ErrorLevelWriter {
+    fn write(
+        &self,
+        now: &mut flexi_logger::DeferredNow,
+        record: &log::Record,
+    ) -> std::io::Result<()> {
+        if record.level() <= log::Level::Warn {
+            self.inner.write(now, record)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn flush(&self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+
+    fn shutdown(&self) {
+        self.inner.shutdown()
+    }
+}
+
+/// Write logs to a `logs` directory next to the executable, rotated daily
+/// with 7 files kept, so log retention no longer depends on the process
+/// launcher's stdout redirection (e.g. nssm or journald). WARN-and-above
+/// lines are additionally kept in a permanent `<name>_error.log`.
+/// The returned handle must be kept alive for the process lifetime;
+/// dropping it shuts the logger down.
+#[allow(dead_code)]
+pub fn setup_logger(name: &str) -> ResultType<flexi_logger::LoggerHandle> {
+    let log_dir = std::env::current_exe()?
+        .parent()
+        .map(|d| d.to_path_buf())
+        .unwrap_or_default()
+        .join("logs");
+    std::fs::create_dir_all(&log_dir)?;
+    let error_writer = flexi_logger::writers::FileLogWriter::builder(
+            flexi_logger::FileSpec::default()
+                .directory(log_dir.clone())
+                .basename(format!("{name}_error"))
+                .suffix("log")
+                .suppress_timestamp(),
+        )
+        .format(flexi_logger::opt_format)
+        .append()
+        .try_build()?;
+    let _logger = flexi_logger::Logger::try_with_env_or_str("info")?
+        .log_to_file_and_writer(
+            flexi_logger::FileSpec::default()
+                .directory(log_dir)
+                .basename(name.to_owned())
+                .suffix("log"),
+            Box::new(ErrorLevelWriter {
+                inner: error_writer,
+            }),
+        )
+        .rotate(
+            flexi_logger::Criterion::Age(flexi_logger::Age::Day),
+            flexi_logger::Naming::Timestamps,
+            flexi_logger::Cleanup::KeepLogFiles(7),
+        )
+        .format(flexi_logger::opt_format)
+        .write_mode(flexi_logger::WriteMode::BufferAndFlush)
+        .start()?;
+    Ok(_logger)
+}
+
+#[cfg(test)]
+mod logger_tests {
+    use hbb_common::log;
+
+    #[test]
+    fn setup_logger_routes_warnings_to_error_file() {
+        let dir = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("logs");
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            // Dropping the handle at scope end flushes and closes the files.
+            let _handle = super::setup_logger("logtest").unwrap();
+            log::error!("ERROR_MARKER_123");
+            log::warn!("WARN_MARKER_456");
+            log::info!("INFO_MARKER_789");
+        }
+        let err_log = std::fs::read_to_string(dir.join("logtest_error.log")).unwrap();
+        assert!(err_log.contains("ERROR_MARKER_123"));
+        assert!(err_log.contains("WARN_MARKER_456"));
+        assert!(!err_log.contains("INFO_MARKER_789"));
+        let main_log = std::fs::read_to_string(dir.join("logtest_rCURRENT.log")).unwrap();
+        assert!(main_log.contains("ERROR_MARKER_123"));
+        assert!(main_log.contains("WARN_MARKER_456"));
+        assert!(main_log.contains("INFO_MARKER_789"));
+    }
+}
+
 #[allow(dead_code)]
 pub(crate) fn test_if_valid_server(host: &str, name: &str) -> ResultType<SocketAddr> {
     use std::net::ToSocketAddrs;
