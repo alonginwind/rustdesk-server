@@ -699,13 +699,27 @@ impl RendezvousServer {
                     }
                     log::trace!("KeyExchange their_pk: {:?}", hex::encode(&ex.keys[0]));
                     log::trace!("KeyExchange box: {:?}", hex::encode(&ex.keys[1]));
-                    let their_pk: [u8; 32] = ex.keys[0].to_vec().try_into().unwrap();
-                    let cryptobox: [u8; 48] = ex.keys[1].to_vec().try_into().unwrap();
-                    let symetric_key = get_symetric_key_from_msg(
+                    let their_pk: Option<[u8; 32]> = ex.keys[0].to_vec().try_into().ok();
+                    let cryptobox: Option<[u8; 48]> = ex.keys[1].to_vec().try_into().ok();
+                    let (their_pk, cryptobox) = match (their_pk, cryptobox) {
+                        (Some(p), Some(c)) => (p, c),
+                        _ => {
+                            log::error!(
+                                "Handshake failed: invalid key lengths in phase 2 key exchange message"
+                            );
+                            return false;
+                        }
+                    };
+                    let symetric_key = match get_symetric_key_from_msg(
                         self.inner.secure_tcp_sk_b.0,
                         their_pk,
                         &cryptobox,
-                    );
+                    ) {
+                        Some(key) => key,
+                        // The client may hold a stale server public key, or the
+                        // message may be crafted; reject this connection only.
+                        None => return false,
+                    };
                     log::debug!("KeyExchange symetric key: {:?}", hex::encode(&symetric_key));
                     let key = secretbox::Key::from_slice(&symetric_key);
                     match key {
@@ -1995,7 +2009,7 @@ fn get_symetric_key_from_msg(
     our_sk_b: [u8; 32],
     their_pk_b: [u8; 32],
     sealed_value: &[u8; 48],
-) -> [u8; 32] {
+) -> Option<[u8; 32]> {
     let their_pk_b = box_::PublicKey(their_pk_b);
     let nonce = box_::Nonce([0u8; box_::NONCEBYTES]);
     let sk = box_::SecretKey(our_sk_b);
@@ -2004,8 +2018,14 @@ fn get_symetric_key_from_msg(
         Ok(key) => {
             let mut key_array = [0u8; 32];
             key_array.copy_from_slice(&key);
-            key_array
+            Some(key_array)
         }
-        Err(e) => panic!("Error while opening the seal key{:?}", e),
+        // A client holding a stale server public key (or an attacker) can
+        // make this fail; the caller rejects the connection instead of
+        // crashing the whole process (release builds use panic=abort).
+        Err(e) => {
+            log::error!("Handshake failed: failed to open the sealed key: {:?}", e);
+            None
+        }
     }
 }
