@@ -474,7 +474,7 @@ impl RendezvousServer {
             match msg_in.union {
                 Some(rendezvous_message::Union::RegisterPeer(rp)) => {
                     // B registered
-                    if !rp.id.is_empty() {
+                    if !rp.id.is_empty() && rp.id.len() <= MAX_PEER_ID_LEN {
                         log::trace!("New peer registered: {:?} {:?}", &rp.id, &addr);
                         let request_pk = self.update_addr(rp.id, addr).await;
                         let mut msg_out = RendezvousMessage::new();
@@ -574,28 +574,6 @@ impl RendezvousServer {
         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(bytes) {
             // log::debug!("Received TCP message from {}: {:?}", addr, msg_in);
             match msg_in.union {
-                Some(rendezvous_message::Union::RegisterPeer(rp)) => {
-                    // B registered
-                    if !rp.id.is_empty() {
-                        log::trace!("New peer registered: {:?} {:?}", &rp.id, &addr);
-                        let request_pk = self.update_addr(rp.id, addr).await;
-                        let mut msg_out = RendezvousMessage::new();
-                        msg_out.set_register_peer_response(RegisterPeerResponse {
-                            request_pk,
-                            ..Default::default()
-                        });
-                        Self::send_to_sink(sink, msg_out).await;
-                        if self.inner.serial > rp.serial {
-                            let mut msg_out = RendezvousMessage::new();
-                            msg_out.set_configure_update(ConfigUpdate {
-                                serial: self.inner.serial,
-                                rendezvous_servers: (*self.rendezvous_servers).clone(),
-                                ..Default::default()
-                            });
-                            Self::send_to_sink(sink, msg_out).await;
-                        }
-                    }
-                }
                 Some(rendezvous_message::Union::PunchHoleRequest(ph)) => {
                     // there maybe several attempt, so sink can be none
                     if let Some(sink) = sink.take() {
@@ -801,7 +779,7 @@ impl RendezvousServer {
         }
         let id = rk.id;
         let ip = addr.ip().to_string();
-        if id.len() < 6 {
+        if id.len() < 6 || id.len() > MAX_PEER_ID_LEN {
             return Err(UUID_MISMATCH);
             //return Err(send_rk_res(socket, addr, UUID_MISMATCH).await);
         } else if !self.check_ip_blocker(&ip, &id).await {
