@@ -1941,10 +1941,12 @@ async fn send_rk_res(
     socket.send(&msg_out, addr).await
 }
 
-// Windows converts the ICMP "port unreachable" triggered by a previous udp send into
-// WSAECONNRESET(10054) and reports it on the next recv/send of the same socket, while linux
-// discards such ICMP silently. These errors tell nothing about our own socket, recreating it
-// only drops the packets arriving in between, so just ignore them as linux does.
+// Windows converts ICMP-related transport failures into fatal socket errors and reports
+// them on the next recv/send of the same socket, while linux discards such ICMP silently.
+// WSAECONNRESET(10054) comes from ICMP "port unreachable" on a prior send; WSAENETRESET
+//(10052) comes from keep-alive detecting a network-level failure. Neither tells anything
+// about our own socket's health, recreating it only drops the packets arriving in between,
+// so just ignore them as linux does.
 fn is_ignorable_udp_error(err: &hbb_common::anyhow::Error) -> bool {
     match err.downcast_ref::<Error>() {
         Some(err) => {
@@ -1954,10 +1956,12 @@ fn is_ignorable_udp_error(err: &hbb_common::anyhow::Error) -> bool {
                     | std::io::ErrorKind::ConnectionRefused
                     | std::io::ErrorKind::ConnectionAborted
             )
-                // WSAECONNRESET
+                // WSAECONNRESET(10054): ICMP port-unreachable on prior send.
+                // WSAENETRESET(10052): keep-alive detected network failure.
+                // Both are ICMP-derived, non-fatal to our socket, same as linux silent discard.
                 || matches!(
                     err.raw_os_error(),
-                    Some(10054)
+                    Some(10054 | 10052)
                 )
         }
         None => false,
