@@ -60,6 +60,23 @@ enum Data {
 }
 
 const REG_TIMEOUT: i64 = 30_000;
+/// Server-initiated keep-alive on TCP/WS rendezvous connections. Must stay
+/// well below REG_TIMEOUT so a connected peer's registration never expires.
+/// The RustDesk client never initiates keep-alives on a TCP/WS rendezvous
+/// connection, it only answers an empty message with an empty message.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+/// Close a TCP/WS rendezvous connection after this long without any message.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(45);
+/// Bound for taking the sink lock of an already registered connection. Another
+/// task (punch/relay/ICE response) writes the same sink without a timeout of its
+/// own, so this only has to outlast one normal frame write. Missing it touches
+/// nothing on the stream, so the beat is simply skipped.
+const HEARTBEAT_LOCK_TIMEOUT: u64 = 1_000;
+/// Upper bound for one keep-alive write. Cancelling it leaves a possibly
+/// half-written frame on the stream, so hitting it closes the connection. It runs
+/// on the connection's own read loop, which is why the bound is also what keeps
+/// the idle check of that loop alive.
+const HEARTBEAT_SEND_TIMEOUT: u64 = 15_000;
 /// Window for per-id heartbeat source-address statistics used by duplicate
 /// id detection.
 /// All heartbeat paths (UDP RegisterPeer and WS/TCP echo) beat every 15s, so
@@ -329,10 +346,6 @@ impl RendezvousServer {
                 }
             });
         };
-        let conn_map = rs.conn_map.clone();
-        tokio::spawn(async move {
-            heartbeat_loop(conn_map).await;
-        });
         let main_task = async move {
             loop {
                 log::info!("Start");
@@ -731,21 +744,7 @@ impl RendezvousServer {
                     // the connection is the ICE bridge route, keep it open for the trickle
                     return true;
                 }
-                _ => {
-                    if bytes.is_empty() {
-                        let addr_v4 = try_into_v4(addr);
-                        if let Some(sink) = self.conn_map.read().await.get(&addr_v4) {
-                            let peer_id = sink.lock().await.1.clone();
-                            if !peer_id.is_empty() {
-                                self.record_peer_ip(&peer_id, addr).await;
-                                if let Some(peer) = self.pm.get_in_memory(&peer_id).await {
-                                    peer.write().await.last_reg_time = Instant::now();
-                                    return true;
-                                }
-                            }
-                        }
-                    }
-                }
+                _ => {}
             }
         }
         false
@@ -1276,12 +1275,17 @@ impl RendezvousServer {
         let target = try_into_v4(target);
         let mut msg_out = RendezvousMessage::new();
         msg_out.set_ice_candidate(ice);
-        if let Some(sink_arc) = self.conn_map.read().await.get(&target).cloned() {
+        // Both lookups are cloned out into their own statement: a guard created in
+        // an `if let` condition lives until the end of that statement, so writing
+        // inside the block would hold the table lock across the send below.
+        let sink_arc = self.conn_map.read().await.get(&target).cloned();
+        if let Some(sink_arc) = sink_arc {
             let mut sink = sink_arc.lock().await;
             sink.0.send(&msg_out).await;
             return Ok(());
         }
-        if let Some(tcp) = self.tcp_punch.lock().await.get(&target).cloned() {
+        let tcp = self.tcp_punch.lock().await.get(&target).cloned();
+        if let Some(tcp) = tcp {
             let mut tcp = tcp.lock().await;
             tcp.send(&msg_out).await;
             return Ok(());
@@ -1690,11 +1694,47 @@ impl RendezvousServer {
                 sink: a,
                 encrypt: None,
             }));
-            while let Ok(Some(Ok(msg))) = timeout(REG_TIMEOUT as u64, b.next()).await {
-                if let tungstenite::Message::Binary(bytes) = msg {
-                    if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
-                        break;
+            let mut last_recv = Instant::now();
+            let mut recv_any = false;
+            let mut heartbeat = interval(HEARTBEAT_INTERVAL);
+            heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            heartbeat.tick().await;
+            loop {
+                let res = tokio::select! {
+                    res = b.next() => res,
+                    _ = heartbeat.tick() => {
+                        if last_recv.elapsed() > IDLE_TIMEOUT {
+                            log::info!("Ws connection from {:?} idle timeout", addr);
+                            break;
+                        }
+                        // A write that did not finish in time leaves a partial frame
+                        // on the stream, so the connection is dropped rather than reused.
+                        if recv_any && !self.send_heartbeat(&mut sink, addr).await {
+                            break;
+                        }
+                        continue;
                     }
+                };
+                let Some(Ok(msg)) = res else {
+                    break;
+                };
+                last_recv = Instant::now();
+                recv_any = true;
+                match msg {
+                    tungstenite::Message::Binary(bytes) => {
+                        // Keep-alive answer: refresh the peer's registration so it
+                        // stays online. Do not echo it, the client would echo back
+                        // and both sides would ping-pong.
+                        if bytes.is_empty() {
+                            self.update_peer_registration(addr).await;
+                            continue;
+                        }
+                        if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
+                            break;
+                        }
+                    }
+                    tungstenite::Message::Close(_) => break,
+                    _ => {}
                 }
             }
         } else {
@@ -1712,7 +1752,35 @@ impl RendezvousServer {
             // can still decrypt the controller's later encrypted ICE candidates; otherwise they fail
             // to parse, handle_tcp returns false, and the connection (and remaining candidates) dies.
             let mut dec: Option<Encrypt> = None;
-            while let Ok(Some(Ok(mut bytes))) = timeout(REG_TIMEOUT as u64, b.next()).await {
+            let mut last_recv = Instant::now();
+            let mut recv_any = false;
+            let mut heartbeat = interval(HEARTBEAT_INTERVAL);
+            heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            heartbeat.tick().await;
+            loop {
+                let res = tokio::select! {
+                    res = b.next() => res,
+                    _ = heartbeat.tick() => {
+                        if last_recv.elapsed() > IDLE_TIMEOUT {
+                            log::info!("Tcp connection from {:?} idle timeout", addr);
+                            break;
+                        }
+                        // Not before the client's first message: until then the
+                        // secure_tcp handshake may still be in progress and the sink
+                        // is not encrypted yet.
+                        // A write that did not finish in time leaves a partial frame
+                        // on the stream, so the connection is dropped rather than reused.
+                        if recv_any && !self.send_heartbeat(&mut sink, addr).await {
+                            break;
+                        }
+                        continue;
+                    }
+                };
+                let Some(Ok(mut bytes)) = res else {
+                    break;
+                };
+                last_recv = Instant::now();
+                recv_any = true;
                 // log::debug!("receive tcp data from {:?} {:?}", addr, bytes);
                 if dec.is_none() {
                     if let Some(Sink::Tss(s)) = sink.as_mut() {
@@ -1724,6 +1792,11 @@ impl RendezvousServer {
                         log::error!("dec tcp data from {:?} err: {:?}", addr, err);
                         break;
                     }
+                }
+                // Keep-alive answer: refresh the peer's registration, do not echo.
+                if bytes.is_empty() {
+                    self.update_peer_registration(addr).await;
+                    continue;
                 }
                 if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
                     break;
@@ -1737,6 +1810,71 @@ impl RendezvousServer {
         self.conn_map.write().await.remove(&try_into_v4(addr));
         log::debug!("Tcp connection from {:?} closed", addr);
         Ok(())
+    }
+
+    /// Sends one empty keep-alive message to the peer of this connection.
+    /// After a successful RegisterPk the sink has been moved into conn_map, so
+    /// look it up there in that case.
+    ///
+    /// Returns false when the write did not finish in time. Cancelling it leaves a
+    /// possibly half-written frame on the stream, so the caller must drop the
+    /// connection instead of reusing it.
+    async fn send_heartbeat(&self, sink: &mut Option<Sink>, addr: SocketAddr) -> bool {
+        let msg = RendezvousMessage::new();
+        if let Some(sink) = sink.as_mut() {
+            return Self::send_keep_alive(sink, &msg, addr).await;
+        }
+        // Clone the Arc out before awaiting the write: holding the table lock
+        // across it would let one peer that stopped reading stall every
+        // registration and cleanup that needs the write lock.
+        let sink = self.conn_map.read().await.get(&try_into_v4(addr)).cloned();
+        let Some(sink) = sink else {
+            // Sink moved into tcp_punch (punch/relay socket), nothing to keep alive.
+            return true;
+        };
+        // Another task (punch/relay/ICE response) writes this sink without a
+        // timeout of its own, so waiting for the lock is bounded too: giving up
+        // touches nothing on the stream, so this beat is skipped.
+        // Mutex::lock is cancel-safe, unlike the write in send_keep_alive.
+        let mut guard = match timeout(HEARTBEAT_LOCK_TIMEOUT, sink.lock()).await {
+            Ok(guard) => guard,
+            Err(_) => {
+                log::warn!("Keep-alive to {:?} skipped, sink lock busy", addr);
+                return true;
+            }
+        };
+        Self::send_keep_alive(&mut guard.0, &msg, addr).await
+    }
+
+    /// Writes one keep-alive frame with a bounded wait. Only this connection's
+    /// own sink lock is held across the write, never the connection table.
+    async fn send_keep_alive(sink: &mut Sink, msg: &RendezvousMessage, addr: SocketAddr) -> bool {
+        match timeout(HEARTBEAT_SEND_TIMEOUT, sink.send(msg)).await {
+            Ok(()) => true,
+            Err(_) => {
+                log::warn!("Keep-alive to {:?} timed out, closing", addr);
+                false
+            }
+        }
+    }
+
+    /// Refreshes the registration of the peer owning this connection when it
+    /// answers a server keep-alive with an empty message.
+    async fn update_peer_registration(&self, addr: SocketAddr) {
+        // Clone the Arc out first: the table lock must not be held while waiting
+        // for the peer's sink lock or for the peer map below.
+        let sink = self.conn_map.read().await.get(&try_into_v4(addr)).cloned();
+        let Some(sink) = sink else {
+            return;
+        };
+        let peer_id = sink.lock().await.1.clone();
+        if peer_id.is_empty() {
+            return;
+        }
+        self.record_peer_ip(&peer_id, addr).await;
+        if let Some(peer) = self.pm.get_in_memory(&peer_id).await {
+            peer.write().await.last_reg_time = Instant::now();
+        }
     }
 
     #[inline]
@@ -1832,32 +1970,6 @@ impl RendezvousServer {
                 Self::send_to_sink(sink, msg_out).await;
             }
             None => {}
-        }
-    }
-}
-
-async fn heartbeat_loop(conn_map: Arc<RwLock<HashMap<SocketAddr, Arc<Mutex<(Sink, String)>>>>>) {
-    loop {
-        tokio::time::sleep(std::time::Duration::from_millis(REG_TIMEOUT as u64 / 2)).await;
-
-        let sinks = {
-            let map = conn_map.read().await;
-            map.values().cloned().collect::<Vec<_>>()
-        };
-
-        for chunk in sinks.chunks(200) {
-            for sink in chunk {
-                let sink = sink.clone();
-                tokio::spawn(async move {
-                    if let Ok(mut s) = sink.try_lock() {
-                        let _ = timeout(REG_TIMEOUT as u64, async {
-                            s.0.send(&RendezvousMessage::new()).await
-                        }).await;
-                    }
-                });
-            }
-            // Wait for a bit before sending the next chunk
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     }
 }
