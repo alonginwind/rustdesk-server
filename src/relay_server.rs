@@ -42,6 +42,19 @@ static DOWNGRADE_START_CHECK: AtomicUsize = AtomicUsize::new(1_800_000); // in m
 static LIMIT_SPEED: AtomicUsize = AtomicUsize::new(32 * 1024 * 1024); // in bit/s
 static TOTAL_BANDWIDTH: AtomicUsize = AtomicUsize::new(1024 * 1024 * 1024); // in bit/s
 static SINGLE_BANDWIDTH: AtomicUsize = AtomicUsize::new(128 * 1024 * 1024); // in bit/s
+/// Timeout (in milliseconds) for a single unidirectional relay write.
+///
+/// Forwarding inside `relay()` is done with `.await` calls placed in the
+/// `select!` branch handlers. If the receiver stops reading (zero window,
+/// stuck process, half-open socket), such a write blocks forever and the loop
+/// never gets back to `select!` to poll the idle timer. The relay then
+/// forwards nothing, never times out and keeps both sockets open, which shows
+/// up as the remote side stuck at "connected but waiting for video".
+///
+/// It only triggers when writes really cannot make progress: `send_raw` just
+/// copies bytes into the kernel send buffer, which takes milliseconds even on
+/// a slow link. Can be overridden with RELAY_WRITE_TIMEOUT (in seconds).
+static RELAY_WRITE_TIMEOUT: AtomicUsize = AtomicUsize::new(15_000); // in ms
 const BLACKLIST_FILE: &str = "blacklist.txt";
 const BLOCKLIST_FILE: &str = "blocklist.txt";
 
@@ -146,7 +159,17 @@ fn check_params() {
     log::info!(
         "SINGLE_BANDWIDTH: {}Mb/s",
         SINGLE_BANDWIDTH.load(Ordering::SeqCst) as f64 / 1024. / 1024.
-    )
+    );
+    let tmp = std::env::var("RELAY_WRITE_TIMEOUT")
+        .map(|x| x.parse::<usize>().unwrap_or(0))
+        .unwrap_or(0);
+    if tmp > 0 {
+        RELAY_WRITE_TIMEOUT.store(tmp * 1000, Ordering::SeqCst);
+    }
+    log::info!(
+        "RELAY_WRITE_TIMEOUT: {}s",
+        RELAY_WRITE_TIMEOUT.load(Ordering::SeqCst) / 1000
+    );
 }
 
 async fn check_cmd(cmd: &str, limiter: Limiter) -> String {
@@ -466,6 +489,31 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
     }
 }
 
+/// Unidirectional forwarding with a write timeout.
+///
+/// `send_raw` hangs forever when the receiver does not read (see
+/// [`RELAY_WRITE_TIMEOUT`]); turning that into a regular error lets [`relay`]
+/// return quickly so that both sockets get closed together.
+///
+/// `to` names the write target: "peer" is the connection that arrived first and
+/// was parked in `PEERS`, "stream" is the one that arrived later and completed
+/// the pairing. The address logged by `make_pair_` ("Relay of ...") is the latter.
+async fn send_with_timeout(
+    stream: &mut (dyn StreamTrait + '_),
+    bytes: Bytes,
+    to: &str,
+) -> ResultType<()> {
+    let ms = RELAY_WRITE_TIMEOUT.load(Ordering::SeqCst) as u64;
+    match timeout(ms, stream.send_raw(bytes)).await {
+        Ok(res) => res,
+        Err(_) => bail!(
+            "send to {} timeout ({}s), receiver is not reading",
+            to,
+            ms / 1000
+        ),
+    }
+}
+
 async fn relay(
     addr: SocketAddr,
     stream: &mut impl StreamTrait,
@@ -503,7 +551,7 @@ async fn relay(
                     total += nb;
                     total_s += nb;
                     if !bytes.is_empty() {
-                        stream.send_raw(bytes.into()).await?;
+                        send_with_timeout(&mut *stream, bytes.into(), "stream").await?;
                     }
                 } else {
                     break;
@@ -522,7 +570,7 @@ async fn relay(
                     total += nb;
                     total_s += nb;
                     if !bytes.is_empty() {
-                        peer.send_raw(bytes.into()).await?;
+                        send_with_timeout(&mut **peer, bytes.into(), "peer").await?;
                     }
                 } else {
                     break;
