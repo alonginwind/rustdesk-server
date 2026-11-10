@@ -8,4 +8,6 @@ elif [ "$1" == "windows" ]; then
     fi
     export SODIUM_LIB_DIR=$(pwd)/target/libsodium/build/lib
     cargo build --release --all-features --target=x86_64-pc-windows-gnu
+elif [ "$1" == "aarch64" ]; then
+    cargo build --release --all-features --target=aarch64-unknown-linux-musl
 fi
