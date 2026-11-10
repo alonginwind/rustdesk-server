@@ -51,6 +51,7 @@ use std::{
 
 use chrono::{Local, Timelike};
 use ip2region::{CachePolicy, Searcher};
+use once_cell::sync::Lazy;
 
 #[derive(Clone, Debug)]
 enum Data {
@@ -90,6 +91,24 @@ const SOURCE_IP_WINDOW: Duration = Duration::from_secs(300);
 /// detection threshold (>8, 9 beats ≈ 135s) guarantees the newest address
 /// only reaches it after this expiry has already evicted the previous one.
 const SOURCE_IP_EXPIRE: Duration = Duration::from_secs(40);
+/// An online query for about 5000 ids is the largest message a client sends here.
+const DEFAULT_MAX_MESSAGE_KB: usize = 64;
+/// A knob that can be turned to unbounded is not a bound.
+const MAX_MESSAGE_KB_CAP: usize = 64 << 10;
+/// tungstenite's default, so raising MAX_MESSAGE_KB does not widen a frame past it.
+const WS_DEFAULT_MAX_FRAME_SIZE: usize = 16 << 20;
+/// Every connection pays its read buffer up front, and tungstenite's default is 128 KiB.
+const WS_BUFFER_SIZE: usize = 8 << 10;
+static MAX_MESSAGE: Lazy<usize> =
+    Lazy::new(|| max_message_kb(&get_arg("MAX_MESSAGE_KB")) << 10);
+
+fn max_message_kb(arg: &str) -> usize {
+    match arg.parse::<usize>() {
+        Ok(kb) if kb > 0 => kb.min(MAX_MESSAGE_KB_CAP),
+        _ => DEFAULT_MAX_MESSAGE_KB,
+    }
+}
+
 type TcpStreamSink = SplitSink<Framed<TcpStream, BytesCodec>, Bytes>;
 type WsSink = SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, tungstenite::Message>;
 struct SafeWsSink {
@@ -118,7 +137,7 @@ impl Sink {
                     if let Some(key) = s.encrypt.as_mut() {
                         bytes = key.enc(&bytes);
                     }
-                    allow_err!(s.sink.send(tungstenite::Message::Binary(bytes)).await)
+                    allow_err!(s.sink.send(tungstenite::Message::Binary(Bytes::from(bytes))).await)
                 }
                 Sink::Tss(s) => {
                     if let Some(key) = s.encrypt.as_mut() {
@@ -262,6 +281,7 @@ impl RendezvousServer {
         log::info!("Listening on tcp/udp :{}", port);
         log::info!("Listening on tcp :{}, extra port for NAT test", nat_port);
         log::info!("Listening on websocket :{}", ws_port);
+        log::info!("MAX_MESSAGE_KB={}", *MAX_MESSAGE >> 10);
         let mut socket = create_udp_listener(port, rmem).await?;
         let (tx, mut rx) = mpsc::unbounded_channel::<Data>();
         let software_url = get_arg("software-url");
@@ -1670,10 +1690,25 @@ impl RendezvousServer {
             });
             return;
         }
-        let stream = FramedStream::from(stream, addr);
+        let mut stream = FramedStream::from(stream, addr);
+        stream.codec_mut().set_max_packet_length(*MAX_MESSAGE);
         tokio::spawn(async move {
             let mut stream = stream;
-            if let Some(Ok(bytes)) = stream.next_timeout(30_000).await {
+            let received = stream.next_timeout(30_000).await;
+            if let Some(Err(e)) = &received {
+                // BytesCodec signals "Too big packet" via InvalidData; that is the
+                // only InvalidData it raises today, so the kind is a sufficient
+                // discriminator without string sniffing.
+                if e.kind() == std::io::ErrorKind::InvalidData {
+                    log::warn!(
+                        "Query from {:?} exceeded the {} byte bound: {}",
+                        addr,
+                        *MAX_MESSAGE,
+                        e
+                    );
+                }
+            }
+            if let Some(Ok(bytes)) = received {
                 if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(&bytes) {
                     match msg_in.union {
                         Some(rendezvous_message::Union::TestNatRequest(_)) => {
@@ -1736,7 +1771,16 @@ impl RendezvousServer {
                 }
                 Ok(response)
             };
-            let ws_stream = timeout(30_000, tokio_tungstenite::accept_hdr_async(stream, callback)).await??;
+            let ws_config = tungstenite::protocol::WebSocketConfig::default()
+                .max_message_size(Some(*MAX_MESSAGE))
+                .max_frame_size(Some((*MAX_MESSAGE).min(WS_DEFAULT_MAX_FRAME_SIZE)))
+                .read_buffer_size(WS_BUFFER_SIZE)
+                .write_buffer_size(WS_BUFFER_SIZE);
+            let ws_stream = timeout(
+                30_000,
+                tokio_tungstenite::accept_hdr_async_with_config(stream, callback, Some(ws_config)),
+            )
+            .await??;
             let (a, mut b) = ws_stream.split();
             sink = Some(Sink::Wss(SafeWsSink {
                 sink: a,
@@ -1763,8 +1807,24 @@ impl RendezvousServer {
                         continue;
                     }
                 };
-                let Some(Ok(msg)) = res else {
-                    break;
+                let msg = match res {
+                    Some(Ok(msg)) => msg,
+                    Some(Err(e)) => {
+                        // tungstenite raises Error::Capacity for every size-bound trip
+                        // (MessageTooLong, FrameTooLong, FrameHeaderTooLong, BufferTooSmall).
+                        // Matching the variant is stable across tungstenite versions, unlike
+                        // the Display strings.
+                        if matches!(e, tungstenite::Error::Capacity(_)) {
+                            log::warn!(
+                                "Ws message from {:?} exceeded the {} byte bound: {}",
+                                addr,
+                                *MAX_MESSAGE,
+                                e
+                            );
+                        }
+                        break;
+                    }
+                    None => break,
                 };
                 last_recv = Instant::now();
                 recv_any = true;
@@ -1786,7 +1846,9 @@ impl RendezvousServer {
                 }
             }
         } else {
-            let (a, mut b) = Framed::new(stream, BytesCodec::new()).split();
+            let mut framed = Framed::new(stream, BytesCodec::new());
+            framed.codec_mut().set_max_packet_length(*MAX_MESSAGE);
+            let (a, mut b) = framed.split();
             sink = Some(Sink::Tss(SafeTcpStreamSink {
                 sink: a,
                 encrypt: None,
@@ -1824,8 +1886,20 @@ impl RendezvousServer {
                         continue;
                     }
                 };
-                let Some(Ok(mut bytes)) = res else {
-                    break;
+                let mut bytes = match res {
+                    Some(Ok(bytes)) => bytes,
+                    Some(Err(e)) => {
+                        if e.kind() == std::io::ErrorKind::InvalidData {
+                            log::warn!(
+                                "Tcp message from {:?} exceeded the {} byte bound: {}",
+                                addr,
+                                *MAX_MESSAGE,
+                                e
+                            );
+                        }
+                        break;
+                    }
+                    None => break,
                 };
                 last_recv = Instant::now();
                 recv_any = true;
@@ -2175,6 +2249,27 @@ fn get_symetric_key_from_msg(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn max_message_kb_falls_back_to_default_and_is_capped() {
+        assert_eq!(max_message_kb(""), DEFAULT_MAX_MESSAGE_KB);
+        assert_eq!(max_message_kb("0"), DEFAULT_MAX_MESSAGE_KB);
+        assert_eq!(max_message_kb("abc"), DEFAULT_MAX_MESSAGE_KB);
+        assert_eq!(max_message_kb("256"), 256);
+        assert_eq!(max_message_kb(&usize::MAX.to_string()), MAX_MESSAGE_KB_CAP);
+    }
+
+    #[test]
+    fn default_message_bound_holds_an_online_query_for_5000_ids() {
+        let mut msg = RendezvousMessage::new();
+        msg.set_online_request(OnlineRequest {
+            id: "1234567890".to_owned(),
+            peers: (0..5000).map(|i| format!("{i:010}")).collect(),
+            ..Default::default()
+        });
+        let len = msg.write_to_bytes().unwrap().len();
+        assert!(len <= DEFAULT_MAX_MESSAGE_KB << 10, "{len}");
+    }
 
     #[test]
     fn relay_uuid_validation() {

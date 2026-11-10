@@ -56,6 +56,15 @@ static SINGLE_BANDWIDTH: AtomicUsize = AtomicUsize::new(128 * 1024 * 1024); // i
 /// copies bytes into the kernel send buffer, which takes milliseconds even on
 /// a slow link. Can be overridden with RELAY_WRITE_TIMEOUT (in seconds).
 static RELAY_WRITE_TIMEOUT: AtomicUsize = AtomicUsize::new(15_000); // in ms
+/// Only the relay request that opens a pair is a framed message of ours; pairing lifts
+/// this bound for a leg that stays framed.
+const MAX_RELAY_REQUEST_LEN: usize = 128 << 10;
+/// Fixed at the handshake, sized for the session a websocket leg carries once paired.
+/// Smaller than tungstenite's 128 KiB default so idle connections pay less.
+const WS_BUFFER_SIZE: usize = 64 << 10;
+/// tungstenite's own defaults, so lifting the bound restores the transport rather than widening it.
+const WS_DEFAULT_MAX_MESSAGE_SIZE: usize = 64 << 20;
+const WS_DEFAULT_MAX_FRAME_SIZE: usize = 16 << 20;
 const BLACKLIST_FILE: &str = "blacklist.txt";
 const BLOCKLIST_FILE: &str = "blocklist.txt";
 
@@ -451,7 +460,15 @@ async fn make_pair(
             }
             Ok(response)
         };
-        let ws_stream = timeout(30_000, tokio_tungstenite::accept_hdr_async(stream, callback)).await??;
+        // The message bound is set in make_pair_, once the handshake is done.
+        let ws_config = tungstenite::protocol::WebSocketConfig::default()
+            .read_buffer_size(WS_BUFFER_SIZE)
+            .write_buffer_size(WS_BUFFER_SIZE);
+        let ws_stream = timeout(
+            30_000,
+            tokio_tungstenite::accept_hdr_async_with_config(stream, callback, Some(ws_config)),
+        )
+        .await??;
         make_pair_(ws_stream, addr, key, limiter).await;
     } else {
         make_pair_(FramedStream::from(stream, addr), addr, key, limiter).await;
@@ -462,7 +479,22 @@ async fn make_pair(
 /// Checks a configured relay key and pairs a request with a waiting connection.
 async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limiter: Limiter) {
     let mut stream = stream;
-    if let Ok(Some(Ok(bytes))) = timeout(30_000, stream.recv()).await {
+    stream.set_max_packet_length(MAX_RELAY_REQUEST_LEN);
+    let received = timeout(30_000, stream.recv()).await;
+    if let Ok(Some(Err(e))) = &received {
+        // BytesCodec sets InvalidData on "Too big packet"; the WS recv impl above
+        // maps tungstenite's Capacity family onto the same kind. Anything else
+        // (idle timeout, connection reset, non-size protocol error) stays silent.
+        if e.kind() == std::io::ErrorKind::InvalidData {
+            log::warn!(
+                "Relay request from {:?} exceeded the {} byte first-frame bound: {}",
+                addr,
+                MAX_RELAY_REQUEST_LEN,
+                e
+            );
+        }
+    }
+    if let Ok(Some(Ok(bytes))) = received {
         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(&bytes) {
             if let Some(rendezvous_message::Union::RequestRelay(rf)) = msg_in.union {
                 if !key.is_empty() && rf.licence_key != key {
@@ -479,6 +511,12 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
                             peer.set_raw();
                             stream.set_raw();
                             log::info!("Both are raw");
+                        } else {
+                            // A leg that stays framed now carries session data, so drop the
+                            // relay-request-only bound. Websocket legs keep their transport
+                            // default (the stub below is a no-op until tungstenite is aligned).
+                            peer.set_max_packet_length(usize::MAX);
+                            stream.set_max_packet_length(usize::MAX);
                         }
                         if let Err(err) = relay(addr, &mut stream, &mut peer, limiter, id.clone()).await
                         {
@@ -666,6 +704,7 @@ trait StreamTrait: Send + Sync + 'static {
     async fn send_raw(&mut self, bytes: Bytes) -> ResultType<()>;
     fn is_ws(&self) -> bool;
     fn set_raw(&mut self);
+    fn set_max_packet_length(&mut self, n: usize);
 }
 
 #[async_trait]
@@ -685,6 +724,10 @@ impl StreamTrait for FramedStream {
     fn set_raw(&mut self) {
         self.set_raw();
     }
+
+    fn set_max_packet_length(&mut self, n: usize) {
+        self.codec_mut().set_max_packet_length(n);
+    }
 }
 
 #[async_trait]
@@ -700,7 +743,18 @@ impl StreamTrait for tokio_tungstenite::WebSocketStream<TcpStream> {
                         _ => Some(Ok(BytesMut::new())),
                     }
                 }
-                Err(err) => Some(Err(Error::new(std::io::ErrorKind::Other, err.to_string()))),
+                Err(err) => {
+                    // Route tungstenite's size-capacity errors to InvalidData so callers
+                    // can discriminate them with `err.kind()` and both WS and framed legs
+                    // share the same convention BytesCodec already uses for its
+                    // "Too big packet" rejection.
+                    let kind = if matches!(err, tungstenite::Error::Capacity(_)) {
+                        std::io::ErrorKind::InvalidData
+                    } else {
+                        std::io::ErrorKind::Other
+                    };
+                    Some(Err(Error::new(kind, err.to_string())))
+                }
             }
         } else {
             None
@@ -708,9 +762,7 @@ impl StreamTrait for tokio_tungstenite::WebSocketStream<TcpStream> {
     }
 
     async fn send_raw(&mut self, bytes: Bytes) -> ResultType<()> {
-        Ok(self
-            .send(tungstenite::Message::Binary(bytes.to_vec()))
-            .await?) // to-do: poor performance
+        Ok(self.send(tungstenite::Message::Binary(bytes)).await?)
     }
 
     fn is_ws(&self) -> bool {
@@ -718,6 +770,118 @@ impl StreamTrait for tokio_tungstenite::WebSocketStream<TcpStream> {
     }
 
     fn set_raw(&mut self) {}
+
+    fn set_max_packet_length(&mut self, n: usize) {
+        self.set_config(|c| {
+            c.max_message_size = Some(n.min(WS_DEFAULT_MAX_MESSAGE_SIZE));
+            c.max_frame_size = Some(n.min(WS_DEFAULT_MAX_FRAME_SIZE));
+        });
+    }
+}
+
+#[cfg(test)]
+mod message_size_tests {
+    use super::*;
+    use hbb_common::{bytes_codec::BytesCodec, tokio_util::codec::Encoder};
+
+    async fn serve_one(ws: bool) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, addr) = listener.accept().await.unwrap();
+            allow_err!(make_pair(stream, addr, "", <Limiter>::new(f64::INFINITY), ws).await);
+        });
+        addr
+    }
+
+    fn relay_request(uuid: &str) -> Vec<u8> {
+        let mut msg = RendezvousMessage::new();
+        msg.set_request_relay(RequestRelay {
+            uuid: uuid.to_owned(),
+            ..Default::default()
+        });
+        msg.write_to_bytes().unwrap()
+    }
+
+    #[hbb_common::tokio::test]
+    async fn relay_request_over_the_bound_is_refused_on_its_header() {
+        let addr = serve_one(false).await;
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let payload_len = MAX_RELAY_REQUEST_LEN + 1;
+        let mut frame = BytesMut::new();
+        BytesCodec::new()
+            .encode(Bytes::from(vec![0u8; payload_len]), &mut frame)
+            .unwrap();
+        client.write_all(&frame[..frame.len() - payload_len]).await.unwrap();
+        let mut byte = [0u8; 1];
+        let read = timeout(5_000, client.read(&mut byte))
+            .await
+            .expect("hbbr waited for the payload of an oversized relay request");
+        assert_eq!(read.unwrap(), 0);
+    }
+
+    async fn ws_client(addr: SocketAddr) -> tokio_tungstenite::WebSocketStream<TcpStream> {
+        let stream = TcpStream::connect(addr).await.unwrap();
+        tokio_tungstenite::client_async(format!("ws://{addr}"), stream)
+            .await
+            .unwrap()
+            .0
+    }
+
+    #[hbb_common::tokio::test]
+    async fn ws_relay_request_over_the_bound_is_refused_on_its_header() {
+        let addr = serve_one(true).await;
+        let mut ws = ws_client(addr).await;
+        let client = ws.get_mut();
+        let mut header = vec![0x82, 0xff];
+        header.extend_from_slice(&(MAX_RELAY_REQUEST_LEN as u64 + 1).to_be_bytes());
+        header.extend_from_slice(&[1, 2, 3, 4]);
+        client.write_all(&header).await.unwrap();
+        let mut buf = [0u8; 256];
+        let closed = timeout(5_000, async {
+            while client.read(&mut buf).await.unwrap_or(0) > 0 {}
+        })
+        .await;
+        assert!(closed.is_ok(), "hbbr waited for the payload of an oversized relay request");
+    }
+
+    #[hbb_common::tokio::test]
+    async fn paired_legs_carry_frames_past_the_relay_request_bound() {
+        let uuid = "paired-legs";
+        let ws_addr = serve_one(true).await;
+        let tcp_addr = serve_one(false).await;
+        let mut ws = ws_client(ws_addr).await;
+        ws.send(tungstenite::Message::Binary(relay_request(uuid).into()))
+            .await
+            .unwrap();
+        // Park the websocket leg first, so the tcp leg is the one that pairs.
+        timeout(5_000, async {
+            while !PEERS.lock().await.contains_key(uuid) {
+                sleep(0.01).await;
+            }
+        })
+        .await
+        .expect("websocket leg never parked");
+        let mut tcp = FramedStream::from(TcpStream::connect(tcp_addr).await.unwrap(), tcp_addr);
+        tcp.send_bytes(relay_request(uuid).into()).await.unwrap();
+        let big = vec![7u8; MAX_RELAY_REQUEST_LEN * 2];
+        tcp.send_bytes(big.clone().into()).await.unwrap();
+        let got = timeout(5_000, ws.next())
+            .await
+            .expect("relay did not forward the tcp frame")
+            .expect("relay closed the websocket leg")
+            .unwrap();
+        assert_eq!(got.into_data(), big);
+        ws.send(tungstenite::Message::Binary(big.clone().into()))
+            .await
+            .unwrap();
+        let got = tcp
+            .next_timeout(5_000)
+            .await
+            .expect("relay did not forward the websocket message")
+            .unwrap();
+        assert_eq!(&got[..], &big[..]);
+    }
 }
 
 #[cfg(test)]
@@ -736,6 +900,8 @@ mod waiter_tests {
         fn is_ws(&self) -> bool { false }
         /// Leaves the test stream unchanged when raw mode is requested.
         fn set_raw(&mut self) {}
+        /// No-op size cap for the test stream.
+        fn set_max_packet_length(&mut self, _: usize) {}
     }
 
     /// Checks that an old timeout cannot remove a replacement waiter.
