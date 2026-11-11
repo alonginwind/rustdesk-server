@@ -835,14 +835,17 @@ impl RendezvousServer {
         _ws: bool,
     ) -> Result<register_pk_response::Result, register_pk_response::Result> {
         if rk.uuid.is_empty() || rk.pk.is_empty() {
+            log::warn!("Peer {} uuid/pk empty", rk.id);
             return Err(INVALID_ID_FORMAT);
         }
         let id = rk.id;
         let ip = addr.ip().to_string();
         if id.len() < 6 || id.len() > MAX_PEER_ID_LEN {
+            log::warn!("Peer {} id len mismatch", id);
             return Err(UUID_MISMATCH);
             //return Err(send_rk_res(socket, addr, UUID_MISMATCH).await);
         } else if !self.check_ip_blocker(&ip, &id).await {
+            log::warn!("Peer {} too frequent", id);
             return Err(TOO_FREQUENT);
             //return Err(send_rk_res(socket, addr, TOO_FREQUENT).await);
         }
