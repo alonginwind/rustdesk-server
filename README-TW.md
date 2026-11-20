@@ -5,6 +5,7 @@
 - 解决当客户端登录了`Api`账号时链接超时的问题
 - s6镜像添加了`Api`支持，`Api`开源地址 https://github.com/lejianwen/rustdesk-api
 - 是否必须登录才能链接， `MUST_LOGIN` 默认为 `N`，设置为 `Y` 则必须登录才能链接
+- hbbs 存取 `Api` 的位址可透過 `-a, --api-addr` 或 `API_ADDR` 設置，預設為 `http://127.0.0.1:21114`
 - `RUSTDESK_API_JWT_KEY`，设置后会通过`JWT`校验token的合法性
 - Support client websocket (client >= 1.4.1)
 
@@ -31,6 +32,7 @@
        - RELAY=<relay_server[:port]>
        - ENCRYPTED_ONLY=1
        - MUST_LOGIN=N
+       - API_ADDR=http://127.0.0.1:21114 # 可選，hbbs 存取 api 的位址，與 api 不在同一台主機時修改
        - TZ=Asia/Shanghai
        - RUSTDESK_API_RUSTDESK_ID_SERVER=<id_server[:21116]>
        - RUSTDESK_API_RUSTDESK_RELAY_SERVER=<relay_server[:21117]>
@@ -396,6 +398,7 @@ Secret Key:  egAVd44u33ZEUIDTtksGcHeVeAwywarEdHmf99KM5ajwEsuG3NQFT9coAfiZ6nen4hf
 | 參數                    | 執行檔       | 敘述                                               |
 |-----------------------|-----------|--------------------------------------------------|
 | ALWAYS_USE_RELAY      | hbbs      | 如果設為 **"Y"**，禁止直接點對點連接                           |
+| API_ADDR              | hbbs      | api 服務位址，用於分享 id 查詢與登入校驗，預設 `http://127.0.0.1:21114`，對應命令列參數 `-a, --api-addr` |
 | DB_URL                | hbbs      | 資料庫的路徑                                           |
 | DOWNGRADE_START_CHECK | hbbr      | 降級檢查之前的延遲時間（以秒為單位）                               |
 | DOWNGRADE_THRESHOLD   | hbbr      | 降級檢查的閾值（bit/ms）                                  |

@@ -6,6 +6,7 @@
 - Solves the issue of connection timeout when the client logs in with an `API` account
 - Added `API` support to the s6 image, `API` open-source repository: https://github.com/lejianwen/rustdesk-api
 - Whether login is required to connect, `MUST_LOGIN` defaults to `N`, set to `Y` to require login for connection
+- The address hbbs uses to reach the `API` can be set with `-a, --api-addr` or `API_ADDR`, defaults to `http://127.0.0.1:21114`
 - `RUSTDESK_API_JWT_KEY`, when set, validates the token's legitimacy through `JWT`
 
 ## docker
@@ -31,6 +32,7 @@
        - RELAY=<relay_server[:port]>
        - ENCRYPTED_ONLY=1
        - MUST_LOGIN=N
+       - API_ADDR=http://127.0.0.1:21114 # optional, address of the api server used by hbbs, change it when the api runs on another host
        - TZ=Asia/Shanghai
        - RUSTDESK_API_RUSTDESK_ID_SERVER=<id_server[:21116]>
        - RUSTDESK_API_RUSTDESK_RELAY_SERVER=<relay_server[:21117]>
@@ -395,6 +397,7 @@ Sie können die Variablen wie üblich angeben oder eine `.env`-Datei verwenden.
 | Variable | Binärdatei | Beschreibung |
 | --- | --- | --- |
 | ALWAYS_USE_RELAY | hbbs | Wenn auf **Y** gesetzt, wird eine direkte Verbindung nicht zugelassen. |
+| API_ADDR | hbbs | Adresse des API-Servers (Abfrage geteilter IDs und Login-Prüfung), standardmäßig `http://127.0.0.1:21114` (Befehlszeilenoption: `-a, --api-addr`) |
 | DB_URL | hbbs | Pfad für die Datenbankdatei |
 | DOWNGRADE_START_CHECK | hbbr | Verzögerung (in Sekunden) vor der Downgrade-Prüfung |
 | DOWNGRADE_THRESHOLD | hbbr | Schwellenwert der Downgrade-Prüfung (Bit/ms)) |

@@ -16,6 +16,7 @@ services:
       - RELAY=<relay_server[:port]>
       - ENCRYPTED_ONLY=1
       - MUST_LOGIN=N
+      # - API_ADDR=http://127.0.0.1:21114  # 可选，hbbs 访问 api 的地址，默认 http://127.0.0.1:21114
       - TZ=Asia/Shanghai
       - RUSTDESK_API_RUSTDESK_ID_SERVER=<id_server[:21116]>
       - RUSTDESK_API_RUSTDESK_RELAY_SERVER=<relay_server[:21117]>
